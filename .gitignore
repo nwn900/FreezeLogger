@@ -1,0 +1,32 @@
+# Local build and packaging output
+/build/
+/package/
+/artifacts/
+/out/
+/.vs/
+/CMakeUserPresets.json
+/CMakeCache.txt
+/compile_commands.json
+
+# Machine-specific deployment records and crash evidence
+/deployments/
+/diagnosis/
+/docs/agent-work/
+*.log
+*.dmp
+*.mdmp
+*.dmp.partial
+
+# Compiled binaries and debug output
+*.dll
+*.exe
+*.pdb
+*.obj
+*.lib
+
+# Local-only settings
+.codebase-memory/
+.env
+.env.*
+!.env.example
+*.user
