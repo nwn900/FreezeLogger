@@ -5,13 +5,15 @@ collector. The DLL uses public F4SE interfaces; no Address Library, CommonLib
 or game memory patches. A separately gated collector adapter reads engine
 context only from a qualified 1.10.163 executable.
 
-Version 0.3.1 adds a bounded 512-entry first-chance exception journal and
-abnormal-exit evidence to the 0.3.0 preincident history, early stacks, optional
-DXGI Present observation, read-only cell/menu context, validated dumps/storage
-retention and collector lifetime guard. A direct F4SE startup smoke test passed
-on Fallout 4 1.10.163 with F4SE 0.6.23, confirming plugin and collector startup
-and the qualified context adapter. Live freeze/crash capture and gameplay
-behavior have not been validated.
+Version 0.3.2 repairs crash-exit correlation and audits detection, evidence,
+retention and release packaging. It bounds foreground suppression, uses an
+awake-time collector deadline, keeps frame sources and samples coherent,
+correlates only recent crash logs from the same game edition/version/session,
+and records that correlation in exit evidence. UTF-8 paths, fault-ring ordinals,
+runtime classification, retention and source packaging have regression tests.
+The direct Fallout 4 1.10.163/F4SE 0.6.23 startup smoke test passed; no save was
+loaded and no real crash or gameplay freeze was reproduced. See
+[validation](docs/VALIDATION.md) for evidence and limits.
 
 ## Install
 
@@ -195,9 +197,13 @@ From an x64 MSVC developer shell with CMake/Ninja:
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build
-ctest --test-dir build --output-on-failure
-python tests/verify_abi.py --all
-cmake --install build --prefix build/package-0.3.1
+ctest --test-dir build --output-on-failure `
+  --output-junit "$((Get-Location).Path)\build\validation-0.3.2.xml"
+python scripts/package.py --build build --config RelWithDebInfo `
+  --stage build/package-0.3.2-release --artifacts artifacts/release-0.3.2 `
+  --test-report build/validation-0.3.2.xml
+python scripts/verify_release.py --build build --config RelWithDebInfo `
+  --package build/package-0.3.2-release
 ```
 
 The ABI verifier uses Python/7-Zip and downloads public SDK evidence into

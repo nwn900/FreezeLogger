@@ -1,6 +1,7 @@
 #include "shared.hpp"
 #include "exceptions.hpp"
 #include "buffout.hpp"
+#include "runtime.hpp"
 #include "consensus.hpp"
 #include <processsnapshot.h>
 #include <dbghelp.h>
@@ -101,11 +102,21 @@ struct Marker {
     ~Marker() { if (value) PssWalkMarkerFree(value); }
 };
 struct Module { DWORD64 base; DWORD size; std::filesystem::path path; };
-struct Observation { LONG64 created = 0, cpu = 0, firstCPU = 0; DWORD64 ip = 0; unsigned samples = 0, repeats = 0; };
+struct Observation {
+    LONG64 created = 0, cpu = 0, firstCPU = 0;
+    DWORD64 ip = 0;
+    unsigned samples = 0;
+    RipSequence ripSequence;
+};
+const Module* moduleContaining(DWORD64 address, const std::vector<Module>& modules) {
+    for (const auto& module : modules)
+        if (address >= module.base && address - module.base < module.size) return &module;
+    return nullptr;
+}
 std::string location(DWORD64 address, const std::vector<Module>& modules) {
     std::ostringstream out;
-    for (const auto& m : modules) if (address >= m.base && address - m.base < m.size) {
-        out << utf8(m.path.filename().wstring()) << "+0x" << std::hex << address - m.base;
+    if (const auto* m = moduleContaining(address, modules)) {
+        out << diagnosticPath(m->path.filename()) << "+0x" << std::hex << address - m->base;
         return out.str();
     }
     out << "0x" << std::hex << address;
@@ -192,7 +203,7 @@ std::string waitChains(const std::vector<DWORD>& ids) {
                                 << " wait_ms=" << n.ThreadObject.WaitTime << " switches=" << n.ThreadObject.ContextSwitches;
                         else {
                             size_t length = wcsnlen(n.LockObject.ObjectName, WCT_OBJNAME_LENGTH);
-                            out << " object=" << utf8(std::wstring_view(n.LockObject.ObjectName, length));
+                            out << " object=" << diagnosticUtf8(std::wstring_view(n.LockObject.ObjectName, length));
                         }
                         out << '\n';
                     }
@@ -235,22 +246,26 @@ std::string rtti(HANDLE process, DWORD64 address, const std::vector<Module>& mod
 std::string diskSHA256(const std::filesystem::path& path) { return sha256(path); }
 // Writes once-per-folder setup notes for WER LocalDumps so a later incident
 // still captures a dump after our own capture failed. Returns true when written.
-bool writeWerFallbackHint(const std::filesystem::path& folder) {
+bool writeWerFallbackHint(const std::filesystem::path& folder, const std::filesystem::path& gameImage) {
     std::error_code ignored;
     auto path = folder / "WER_LocalDumps_Hint.txt";
     if (std::filesystem::exists(path, ignored)) return false;
     std::ofstream out(path, std::ios::trunc);
     if (!out) return false;
+    auto executable = gameImage.filename().wstring();
+    if (executable.empty()) executable = L"Fallout4.exe";
+    const std::string executableUtf8 = diagnosticUtf8(executable);
+    const std::string registrySubkey = "HKLM\\SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\" + executableUtf8;
     out << "FreezeSentryF4 could not write a minidump for an incident (see snapshot_error= or minidump=FAILED\n"
-           "in the incident log). Windows Error Reporting can capture a dump instead:\n\n"
-           "Run as administrator, replacing the dump folder as needed:\n"
-           "  reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\Fallout4.exe\""
-           " /v DumpFolder /t REG_EXPAND_SZ /d \"%USERPROFILE%\\Documents\\CrashDumps\" /f\n"
-           "  reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\Fallout4.exe\""
-           " /v DumpCount /t REG_DWORD /d 5 /f\n"
-           "  reg add \"HKLM\\SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\Fallout4.exe\""
-           " /v DumpType /t REG_DWORD /d 2 /f\n\n"
-           "DumpType 2 is a full dump. Reproduce the incident, then find Fallout4.exe.*.dmp in the dump folder.\n"
+           "in the incident log). These are separate recovery options:\n\n"
+           "For a process that is still frozen, open Task Manager > Details, right-click " << executableUtf8
+        << ", then choose Create dump file. This captures the live hang state.\n\n"
+           "For future process crashes only, Windows Error Reporting LocalDumps can write a dump. Run as administrator,\n"
+           "replacing the dump folder as needed:\n"
+        << "  reg add \"" << registrySubkey << "\" /v DumpFolder /t REG_EXPAND_SZ /d \"%USERPROFILE%\\Documents\\CrashDumps\" /f\n"
+        << "  reg add \"" << registrySubkey << "\" /v DumpCount /t REG_DWORD /d 5 /f\n"
+        << "  reg add \"" << registrySubkey << "\" /v DumpType /t REG_DWORD /d 2 /f\n\n"
+           "DumpType 2 is a full crash dump. LocalDumps does not capture a still-running hang.\n"
            "This file is never removed by retention; delete it to regenerate it.\n";
     out.flush();
     return static_cast<bool>(out);
@@ -259,70 +274,110 @@ bool writeWerFallbackHint(const std::filesystem::path& folder) {
 std::string moduleBaseName(DWORD64 address, const std::vector<Module>& modules) {
     for (const auto& m : modules)
         if (address >= m.base && address - m.base < m.size)
-            return buffout::lower(utf8(m.path.filename().wstring()));
+            return buffout::lower(diagnosticPath(m.path.filename()));
     return {};
-}
-// Images where corruption is usually observed rather than caused: system and
-// graphics libraries, the game and loader images, and crash loggers themselves.
-bool isVictimLocationModule(const std::string& lowerBase) {
-    static const char* victims[] = {
-        "ntdll.dll", "kernel32.dll", "kernelbase.dll", "user32.dll", "win32u.dll",
-        "gdi32.dll", "gdi32full.dll", "combase.dll", "ole32.dll", "oleaut32.dll",
-        "shell32.dll", "shcore.dll", "shlwapi.dll", "msvcrt.dll", "ucrtbase.dll",
-        "msvcp_win.dll", "bcrypt.dll", "bcryptprimitives.dll", "rpcrt4.dll", "sechost.dll",
-        "advapi32.dll", "imm32.dll", "crypt32.dll", "imagehlp.dll", "psapi.dll",
-        "version.dll", "winmm.dll", "ws2_32.dll", "mswsock.dll", "setupapi.dll",
-        "cfgmgr32.dll", "hid.dll", "kernel.appcore.dll", "powrprof.dll", "umpdc.dll",
-        "d3d11.dll", "dxgi.dll", "dwmapi.dll", "uxtheme.dll", "msctf.dll",
-        "fallout4.exe", "fallout4vr.exe", "f4se_1_10_163.dll", "f4se_steam_loader.dll",
-        "steam_api64.dll", "steamclient64.dll", "tier0_s64.dll", "vstdlib_s64.dll",
-        "gameoverlayrenderer64.dll", "buffout4.dll"};
-    for (const char* victim : victims)
-        if (lowerBase == victim) return true;
-    return lowerBase.starts_with("d3dcompiler_") || lowerBase.starts_with("msvcp140") ||
-           lowerBase.starts_with("vcruntime140") || lowerBase.starts_with("concrt140");
 }
 struct ExternalCrash {
     BuffoutCrashInfo info;
     std::string path;
+    bool matched = false;
+    std::uint64_t ageMs = 0;
+    std::string correlation;
 };
-// Newest parseable Buffout-style crash log under the game F4SE folders.
-// Tolerates custom ReportDirectory: the game folders are resolved independently.
-ExternalCrash findExternalCrashLog() {
-    ExternalCrash result;
+std::uint64_t fileTimeValue(FILETIME value) {
+    return (static_cast<std::uint64_t>(value.dwHighDateTime) << 32) | value.dwLowDateTime;
+}
+std::filesystem::path processImage(HANDLE process) {
+    std::array<wchar_t, 32768> path{};
+    DWORD length = static_cast<DWORD>(path.size());
+    if (!QueryFullProcessImageNameW(process, 0, path.data(), &length) || !length) return {};
+    return std::filesystem::path(std::wstring_view(path.data(), length));
+}
+std::string oneLine(std::string value) {
+    for (char& c : value) if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) c = '?';
+    return value;
+}
+// Selects only a crash log matching this game's edition, binary version,
+// process start time, and recent incident window. Other logs remain context.
+ExternalCrash findExternalCrashLog(const std::filesystem::path& gameImage, Shared* state) {
+    ExternalCrash newestMatch, newestContext;
+    std::uint64_t newestMatchTime = 0, newestContextTime = 0;
+    auto gameName = buffout::lower(diagnosticPath(gameImage.filename()));
+    auto edition = gameName == "fallout4vr.exe" ? BuffoutCrashInfo::Edition::Fallout4VR :
+                   gameName == "fallout4.exe" ? BuffoutCrashInfo::Edition::Fallout4 :
+                   BuffoutCrashInfo::Edition::Unknown;
     PWSTR documents = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &documents))) return result;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &documents))) return {};
     std::filesystem::path root(documents);
     CoTaskMemFree(documents);
-    std::filesystem::file_time_type newest = std::filesystem::file_time_type::min();
-    for (const wchar_t* game : {L"Fallout4", L"Fallout4VR"}) {
-        std::error_code error;
-        auto iterator = std::filesystem::directory_iterator(root / "My Games" / game / "F4SE", error);
-        const auto end = std::filesystem::directory_iterator{};
-        for (; !error && iterator != end; iterator.increment(error)) {
-            auto path = iterator->path();
-            if (path.extension() != ".log") continue;
-            std::string stem = buffout::lower(path.stem().string());
-            if (!stem.starts_with("crash") && stem.find("buffout") == std::string::npos) continue;
-            auto size = iterator->file_size(error);
-            if (error || size > 4 * 1024 * 1024) { error.clear(); continue; }
-            std::ifstream in(path, std::ios::binary);
-            if (!in) continue;
-            std::string text(static_cast<std::size_t>(size), '\0');
-            in.read(text.data(), static_cast<std::streamsize>(text.size()));
-            text.resize(static_cast<std::size_t>(in.gcount()));
-            BuffoutCrashInfo info = parseBuffoutCrashLog(text, path.string());
-            if (!info.found) continue;
-            auto time = iterator->last_write_time(error);
-            if (error) { error.clear(); continue; }
-            if (result.path.empty() || time > newest) {
-                newest = time;
-                result.info = std::move(info);
-                result.path = path.string();
-            }
+    if (edition == BuffoutCrashInfo::Edition::Unknown) return {};
+    FILETIME observed{}; GetSystemTimeAsFileTime(&observed);
+    CrashLogSession session;
+    session.edition = edition;
+    session.gameVersion = version(gameImage);
+    session.processStartedFileTime = state ? static_cast<std::uint64_t>(read(state->processCreated)) : 0;
+    session.observedFileTime = fileTimeValue(observed);
+    CrashLogCorrelator correlator(std::move(session));
+    const wchar_t* gameFolder = edition == BuffoutCrashInfo::Edition::Fallout4VR ? L"Fallout4VR" : L"Fallout4";
+    std::error_code error;
+    auto iterator = std::filesystem::directory_iterator(root / "My Games" / gameFolder / "F4SE", error);
+    const auto end = std::filesystem::directory_iterator{};
+    for (; !error && iterator != end; iterator.increment(error)) {
+        auto path = iterator->path();
+        auto extension = path.extension().wstring();
+        for (wchar_t& c : extension) if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
+        if (extension != L".log") continue;
+        auto stem = path.stem().wstring();
+        for (wchar_t& c : stem) if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
+        if (!stem.starts_with(L"crash") && stem.find(L"buffout") == std::wstring::npos) continue;
+        auto size = iterator->file_size(error);
+        if (error || size > 4 * 1024 * 1024) { error.clear(); continue; }
+        WIN32_FILE_ATTRIBUTE_DATA attributes{};
+        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) continue;
+        std::uint64_t written = fileTimeValue(attributes.ftLastWriteTime);
+        std::ifstream in(path, std::ios::binary);
+        if (!in) continue;
+        std::string text(static_cast<std::size_t>(size), '\0');
+        in.read(text.data(), static_cast<std::streamsize>(text.size()));
+        text.resize(static_cast<std::size_t>(in.gcount()));
+        BuffoutCrashInfo info = parseBuffoutCrashLog(text, diagnosticPath(path));
+        if (!info.found) continue;
+        CrashLogMatch match = correlator.assess(info, written);
+        ExternalCrash candidate{std::move(info), diagnosticPath(path), match.matched, match.ageMs, match.reason};
+        if (match.matched && written >= newestMatchTime) {
+            newestMatchTime = written;
+            newestMatch = std::move(candidate);
+        } else if (!match.matched && written >= newestContextTime) {
+            newestContextTime = written;
+            newestContext = std::move(candidate);
         }
     }
-    return result;
+    return newestMatch.matched ? newestMatch : newestContext;
+}
+std::string externalCrashReport(const ExternalCrash& external) {
+    std::ostringstream out;
+    if (external.path.empty()) {
+        out << "EXTERNAL_CRASH_CORRELATION status=none; no parseable crash log found for this game edition\n";
+        return out.str();
+    }
+    out << "EXTERNAL_CRASH_CORRELATION status=" << (external.matched ? "matched" : "context-only")
+        << " correlation=" << external.correlation << " age_ms=" << external.ageMs
+        << " file=" << oneLine(external.path) << '\n';
+    if (!external.matched) {
+        out << "external crash log was not used for current-incident attribution\n";
+        return out.str();
+    }
+    out << "external_game_version=" << external.info.gameVersion
+        << " exception=" << external.info.exceptionName << " code=0x" << std::hex
+        << external.info.exceptionCode << std::dec << " fault="
+        << (external.info.faultModule.empty() ? "unknown-module" : external.info.faultModule)
+        << (external.info.faultOffset.empty() ? "" : "+" + external.info.faultOffset) << '\n';
+    if (!external.info.stackModules.empty()) out << "external_top_frame=" << external.info.stackModules.front() << '\n';
+    out << "Correlation links the Buffout record to this game session; it does not establish a crash cause.\n";
+    return out.str();
+}
+std::string externalCrashEvidence(const std::filesystem::path& gameImage, Shared* state) {
+    return externalCrashReport(findExternalCrashLog(gameImage, state));
 }
 std::string profile(HANDLE target, bool stacks, Shared* state, bool reset) {
     struct CPU { LONG64 created, cpu; };
@@ -331,97 +386,107 @@ std::string profile(HANDLE target, bool stacks, Shared* state, bool reset) {
     std::ostringstream out;
     auto began = now();
     out << "\nPROFILE tick=" << now() << " early_stack=" << stacks << '\n';
-    Snapshot snapshot;
-    snapshot.log = &out;
-    if (stacks && !commitAvailableForClone()) {
-        out << "profile_clone_deferred_low_commit\n";
-        return out.str();
-    }
-    auto flags = static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT |
-                    (stacks ? PSS_CAPTURE_VA_CLONE : 0));
-    auto captureBegan = now();
-    DWORD error = PssCaptureSnapshot(target, flags, CONTEXT_ALL, &snapshot.value);
-    if (error) { out << "profile_snapshot_error=" << error << '\n'; return out.str(); }
-    out << "snapshot_capture_ms=" << now() - captureBegan << '\n';
-    PSS_VA_CLONE_INFORMATION clone{};
-    if (stacks && (error = PssQuerySnapshot(snapshot.value, PSS_QUERY_VA_CLONE_INFORMATION, &clone, sizeof(clone)))) {
-        out << "profile_clone_error=" << error << '\n'; return out.str();
-    }
-    if (stacks && !snapshot.trackClone()) {
-        out << "profile_clone_untracked; capture aborted\n";
-        return out.str();
-    }
-    HANDLE reader = stacks ? clone.VaCloneHandle : target;
-    std::array<HMODULE, 2048> handles{}; DWORD needed = 0;
-    std::vector<Module> modules;
-    if (EnumProcessModulesEx(reader, handles.data(), sizeof(handles), &needed, LIST_MODULES_64BIT)) {
-        for (size_t i = 0; i < std::min<size_t>(needed / sizeof(HMODULE), handles.size()); ++i) {
-            MODULEINFO info{}; std::array<wchar_t, 32768> path{};
-            if (GetModuleInformation(reader, handles[i], &info, sizeof(info)) &&
-                GetModuleFileNameExW(reader, handles[i], path.data(), static_cast<DWORD>(path.size())))
-                modules.push_back({reinterpret_cast<DWORD64>(info.lpBaseOfDll), info.SizeOfImage, path.data()});
+    auto collect = [&] {
+        Snapshot snapshot;
+        snapshot.log = &out;
+        if (stacks && !commitAvailableForClone()) {
+            out << "profile_clone_deferred_low_commit\n";
+            return;
         }
-    }
-    struct Row { DWORD id; LONG64 delta; CONTEXT context; bool valid; };
-    std::vector<Row> rows;
-    std::map<DWORD, CPU> next;
-    Marker marker;
-    error = PssWalkMarkerCreate(nullptr, &marker.value);
-    if (error) { out << "profile_marker_error=" << error << '\n'; return out.str(); }
-    PSS_THREAD_ENTRY entry{};
-    while (rows.size() < 4096 && PssWalkSnapshot(snapshot.value, PSS_WALK_THREADS, marker.value, &entry, sizeof(entry)) == ERROR_SUCCESS) {
-        auto cpu = filetime(entry.UserTime) + filetime(entry.KernelTime), created = filetime(entry.CreateTime);
-        auto old = baseline.find(entry.ThreadId);
-        auto delta = old != baseline.end() && old->second.created == created && cpu >= old->second.cpu ? cpu - old->second.cpu : 0;
-        next[entry.ThreadId] = {created, cpu};
-        bool valid = entry.ContextRecord && entry.SizeOfContextRecord >= sizeof(CONTEXT);
-        rows.push_back({entry.ThreadId, delta, valid ? *entry.ContextRecord : CONTEXT{}, valid});
-    }
-    baseline = std::move(next);
-    std::sort(rows.begin(), rows.end(), [state](const Row& a, const Row& b) {
-        auto priority = [state](DWORD id) { return state && (id == static_cast<DWORD>(read(state->thread[0])) ||
-            id == static_cast<DWORD>(read(state->thread[1])) || id == static_cast<DWORD>(read(state->frameThread))); };
-        if (priority(a.id) != priority(b.id)) return priority(a.id);
-        return a.delta > b.delta;
-    });
-    bool symbols = false;
-    if (stacks) {
-        SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
-        symbols = SymInitializeW(reader, L"", FALSE) != FALSE;
-        if (symbols) for (const auto& module : modules)
-            SymLoadModuleExW(reader, nullptr, module.path.c_str(), nullptr, module.base, module.size, nullptr, 0);
-    }
-    struct Symbols { HANDLE process; bool ready; ~Symbols() { if (ready) SymCleanup(process); } } cleanup{reader, symbols};
-    out << "CPU deltas belong to threads; sampled RIP modules do not establish DLL CPU ownership.\n";
-    unsigned limit = stacks ? 16 : 64;
-    for (unsigned i = 0; i < std::min<size_t>(rows.size(), limit); ++i) {
-        const auto& row = rows[i];
-        out << "thread=" << row.id << " cpu_delta_100ns=" << row.delta << " sampled_RIP="
-            << (row.valid ? location(row.context.Rip, modules) : "unavailable") << '\n';
-        if (!stacks || !row.valid || !symbols) continue;
-        CONTEXT context = row.context; STACKFRAME64 frame{};
-        frame.AddrPC = {context.Rip, 0, AddrModeFlat}; frame.AddrStack = {context.Rsp, 0, AddrModeFlat}; frame.AddrFrame = {context.Rbp, 0, AddrModeFlat};
-        DWORD64 pc = 0, sp = 0;
-        for (unsigned depth = 0; depth < 16; ++depth) {
-            if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, reader, nullptr, &frame, &context, nullptr,
-                             SymFunctionTableAccess64, SymGetModuleBase64, nullptr) || !frame.AddrPC.Offset ||
-                (frame.AddrPC.Offset == pc && frame.AddrStack.Offset == sp)) break;
-            pc = frame.AddrPC.Offset; sp = frame.AddrStack.Offset;
-            out << "  early#" << depth << ' ' << location(pc, modules);
-            alignas(SYMBOL_INFO) std::array<std::byte, sizeof(SYMBOL_INFO) + MAX_SYM_NAME> storage{};
-            auto* symbol = reinterpret_cast<SYMBOL_INFO*>(storage.data());
-            symbol->SizeOfStruct = sizeof(SYMBOL_INFO); symbol->MaxNameLen = MAX_SYM_NAME; DWORD64 offset = 0;
-            if (SymFromAddr(reader, pc, &offset, symbol)) out << ' ' << symbol->Name << "+0x" << std::hex << offset << std::dec;
-            out << '\n';
+        auto flags = static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT |
+                        (stacks ? PSS_CAPTURE_VA_CLONE : 0));
+        auto captureBegan = now();
+        DWORD error = PssCaptureSnapshot(target, flags, CONTEXT_ALL, &snapshot.value);
+        if (error) { out << "profile_snapshot_error=" << error << '\n'; return; }
+        out << "snapshot_capture_ms=" << now() - captureBegan << '\n';
+        PSS_VA_CLONE_INFORMATION clone{};
+        if (stacks && (error = PssQuerySnapshot(snapshot.value, PSS_QUERY_VA_CLONE_INFORMATION, &clone, sizeof(clone)))) {
+            out << "profile_clone_error=" << error << '\n'; return;
         }
-    }
-    out << "profile_threads=" << rows.size() << " listed=" << std::min<size_t>(rows.size(), limit) << '\n';
+        if (stacks && !snapshot.trackClone()) {
+            out << "profile_clone_untracked; capture aborted\n";
+            return;
+        }
+        HANDLE reader = stacks ? clone.VaCloneHandle : target;
+        std::array<HMODULE, 2048> handles{}; DWORD needed = 0;
+        std::vector<Module> modules;
+        if (EnumProcessModulesEx(reader, handles.data(), sizeof(handles), &needed, LIST_MODULES_64BIT)) {
+            for (size_t i = 0; i < std::min<size_t>(needed / sizeof(HMODULE), handles.size()); ++i) {
+                MODULEINFO info{}; std::array<wchar_t, 32768> path{};
+                if (GetModuleInformation(reader, handles[i], &info, sizeof(info)) &&
+                    GetModuleFileNameExW(reader, handles[i], path.data(), static_cast<DWORD>(path.size())))
+                    modules.push_back({reinterpret_cast<DWORD64>(info.lpBaseOfDll), info.SizeOfImage, path.data()});
+            }
+        }
+        struct Row { DWORD id; LONG64 delta; CONTEXT context; bool valid; };
+        std::vector<Row> rows;
+        std::map<DWORD, CPU> next;
+        Marker marker;
+        error = PssWalkMarkerCreate(nullptr, &marker.value);
+        if (error) { out << "profile_marker_error=" << error << '\n'; return; }
+        PSS_THREAD_ENTRY entry{};
+        while (rows.size() < 4096 && PssWalkSnapshot(snapshot.value, PSS_WALK_THREADS, marker.value, &entry, sizeof(entry)) == ERROR_SUCCESS) {
+            auto cpu = filetime(entry.UserTime) + filetime(entry.KernelTime), created = filetime(entry.CreateTime);
+            auto old = baseline.find(entry.ThreadId);
+            auto delta = old != baseline.end() && old->second.created == created && cpu >= old->second.cpu ? cpu - old->second.cpu : 0;
+            next[entry.ThreadId] = {created, cpu};
+            bool valid = entry.ContextRecord && entry.SizeOfContextRecord >= sizeof(CONTEXT);
+            rows.push_back({entry.ThreadId, delta, valid ? *entry.ContextRecord : CONTEXT{}, valid});
+        }
+        baseline = std::move(next);
+        const std::array<DWORD, 3> priorityIds{
+            state ? static_cast<DWORD>(read(state->thread[0])) : 0,
+            state ? static_cast<DWORD>(read(state->thread[1])) : 0,
+            state ? static_cast<DWORD>(read(state->frameThread)) : 0};
+        auto isPriority = [&priorityIds](DWORD id) {
+            return id && std::find(priorityIds.begin(), priorityIds.end(), id) != priorityIds.end();
+        };
+        std::sort(rows.begin(), rows.end(), [&isPriority](const Row& a, const Row& b) {
+            bool priorityA = isPriority(a.id), priorityB = isPriority(b.id);
+            if (priorityA != priorityB) return priorityA;
+            return a.delta > b.delta;
+        });
+        bool symbols = false;
+        if (stacks) {
+            SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_NO_PROMPTS);
+            symbols = SymInitializeW(reader, L"", FALSE) != FALSE;
+            if (symbols) for (const auto& module : modules)
+                SymLoadModuleExW(reader, nullptr, module.path.c_str(), nullptr, module.base, module.size, nullptr, 0);
+        }
+        struct Symbols { HANDLE process; bool ready; ~Symbols() { if (ready) SymCleanup(process); } } cleanup{reader, symbols};
+        out << "CPU deltas belong to threads; sampled RIP modules do not establish DLL CPU ownership.\n";
+        unsigned limit = stacks ? 16 : 64;
+        for (unsigned i = 0; i < std::min<size_t>(rows.size(), limit); ++i) {
+            const auto& row = rows[i];
+            out << "thread=" << row.id << " cpu_delta_100ns=" << row.delta << " sampled_RIP="
+                << (row.valid ? location(row.context.Rip, modules) : "unavailable") << '\n';
+            if (!stacks || !row.valid || !symbols) continue;
+            CONTEXT context = row.context; STACKFRAME64 frame{};
+            frame.AddrPC = {context.Rip, 0, AddrModeFlat}; frame.AddrStack = {context.Rsp, 0, AddrModeFlat}; frame.AddrFrame = {context.Rbp, 0, AddrModeFlat};
+            DWORD64 pc = 0, sp = 0;
+            for (unsigned depth = 0; depth < 16; ++depth) {
+                if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, reader, nullptr, &frame, &context, nullptr,
+                                 SymFunctionTableAccess64, SymGetModuleBase64, nullptr) || !frame.AddrPC.Offset ||
+                    (frame.AddrPC.Offset == pc && frame.AddrStack.Offset == sp)) break;
+                pc = frame.AddrPC.Offset; sp = frame.AddrStack.Offset;
+                out << "  early#" << depth << ' ' << location(pc, modules);
+                alignas(SYMBOL_INFO) std::array<std::byte, sizeof(SYMBOL_INFO) + MAX_SYM_NAME> storage{};
+                auto* symbol = reinterpret_cast<SYMBOL_INFO*>(storage.data());
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO); symbol->MaxNameLen = MAX_SYM_NAME; DWORD64 offset = 0;
+                if (SymFromAddr(reader, pc, &offset, symbol)) out << ' ' << symbol->Name << "+0x" << std::hex << offset << std::dec;
+                out << '\n';
+            }
+        }
+        out << "profile_threads=" << rows.size() << " listed=" << std::min<size_t>(rows.size(), limit) << '\n';
+    };
+    collect(); // Snapshot, marker, and symbol cleanup finish before elapsed time is written.
     out << "profile_elapsed_ms=" << now() - began << '\n';
     return out.str();
 }
 bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
              const std::string& reason, Shared* state, bool dump, const std::string& history) {
     ExceptionJournal exceptionJournal(state);
+    const auto gameImage = processImage(target);
     SYSTEMTIME utc{}; GetSystemTime(&utc);
     std::ostringstream stem;
     // Manual snapshots use their own name class so per-category retention caps
@@ -473,7 +538,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     snapshot.log = &log;
     if (!commitAvailableForClone()) {
         log << "snapshot_deferred_low_commit; no thread snapshot or minidump available\n";
-        if (writeWerFallbackHint(folder)) log << "wer_fallback_hint=written\n";
+        if (writeWerFallbackHint(folder, gameImage)) log << "wer_fallback_hint=written\n";
         return false;
     }
     auto flags = static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_VA_CLONE | PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT);
@@ -481,7 +546,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     DWORD error = PssCaptureSnapshot(target, flags, CONTEXT_ALL, &snapshot.value);
     if (error != ERROR_SUCCESS) {
         log << "snapshot_error=" << error << "; no thread snapshot or minidump available\n";
-        if (writeWerFallbackHint(folder)) log << "wer_fallback_hint=written\n";
+        if (writeWerFallbackHint(folder, gameImage)) log << "wer_fallback_hint=written\n";
         return false;
     }
     if (!snapshot.trackClone()) {
@@ -514,9 +579,9 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
             success = false; dumpError = GetLastError(); validation = "rename failed";
         }
         if (!success && createdFile) { std::error_code ignored; std::filesystem::remove(partial, ignored); }
-        log << "minidump=" << (success ? dumpPath.filename().string() : "FAILED")
+        log << "minidump=" << (success ? diagnosticPath(dumpPath.filename()) : "FAILED")
             << " error=" << dumpError << " structural_validation=" << validation << '\n';
-        if (!success && writeWerFallbackHint(folder)) log << "wer_fallback_hint=written\n";
+        if (!success && writeWerFallbackHint(folder, gameImage)) log << "wer_fallback_hint=written\n";
         log.flush();
     }
     std::vector<Module> modules;
@@ -530,7 +595,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
             if (!GetModuleInformation(clone.VaCloneHandle, handles[i], &info, sizeof(info))) continue;
             GetModuleFileNameExW(clone.VaCloneHandle, handles[i], path.data(), static_cast<DWORD>(path.size()));
             Module m{reinterpret_cast<DWORD64>(info.lpBaseOfDll), info.SizeOfImage, path.data()};
-            log << "base=0x" << std::hex << m.base << " size=0x" << m.size << std::dec << ' ' << utf8(m.path.wstring()) << '\n';
+            log << "base=0x" << std::hex << m.base << " size=0x" << m.size << std::dec << ' ' << diagnosticPath(m.path) << '\n';
             identities.insert_or_assign(m.path.wstring(), m);
             IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS64 nt{};
             if (remote(clone.VaCloneHandle, m.base, dos) && dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0 &&
@@ -562,9 +627,11 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     if (symbols) for (const auto& m : modules)
         SymLoadModuleExW(clone.VaCloneHandle, nullptr, m.path.c_str(), nullptr, m.base, m.size, nullptr, 0);
     if (symbols && sample == 0) for (const auto& m : modules) {
-        IMAGEHLP_MODULE64 info{}; info.SizeOfStruct = sizeof(info);
-        if (SymGetModuleInfo64(clone.VaCloneHandle, m.base, &info)) {
-            log << "symbols module=" << utf8(m.path.filename().wstring()) << " type=" << info.SymType << " pdb=" << info.LoadedPdbName
+        IMAGEHLP_MODULEW64 info{}; info.SizeOfStruct = sizeof(info);
+        if (SymGetModuleInfoW64(clone.VaCloneHandle, m.base, &info)) {
+            const auto pdbLength = wcsnlen(info.LoadedPdbName, std::size(info.LoadedPdbName));
+            log << "symbols module=" << diagnosticPath(m.path.filename()) << " type=" << info.SymType << " pdb="
+                << diagnosticUtf8(std::wstring_view(info.LoadedPdbName, pdbLength))
                 << " pdb_age=" << info.PdbAge << " pdb_signature=" << std::hex << info.PdbSig70.Data1 << '-' << info.PdbSig70.Data2
                 << '-' << info.PdbSig70.Data3 << '-';
             for (auto byte : info.PdbSig70.Data4) log << std::setfill('0') << std::setw(2) << static_cast<unsigned>(byte);
@@ -581,7 +648,12 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
         if (!sample) threadIDs.push_back(entry.ThreadId);
         LONG64 cpu = filetime(entry.UserTime) + filetime(entry.KernelTime);
         auto& observation = observations[entry.ThreadId];
-        if (!observation.samples || observation.created != filetime(entry.CreateTime)) observation = {filetime(entry.CreateTime), cpu, cpu, 0, 0, 0};
+        if (!observation.samples || observation.created != filetime(entry.CreateTime)) {
+            observation = {};
+            observation.created = filetime(entry.CreateTime);
+            observation.cpu = cpu;
+            observation.firstCPU = cpu;
+        }
         log << "thread=" << entry.ThreadId << " sample_cpu_delta_100ns=" << (observation.samples ? cpu - observation.cpu : 0) << '\n';
         observation.cpu = cpu;
         log << "\nthread=" << entry.ThreadId << " cpu_user_100ns=" << filetime(entry.UserTime)
@@ -595,13 +667,16 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
             Handle thread(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.ThreadId));
             PWSTR name = nullptr;
             if (thread.value && SUCCEEDED(describe(thread, &name)) && name) {
-                log << "thread_name=" << utf8(name) << '\n'; LocalFree(name);
+                log << "thread_name=" << diagnosticUtf8(name) << '\n'; LocalFree(name);
             }
         }
         if (!entry.ContextRecord || entry.SizeOfContextRecord < sizeof(CONTEXT)) { log << "context unavailable\n"; continue; }
         CONTEXT context = *entry.ContextRecord;
-        if (observation.samples && observation.ip == context.Rip) ++observation.repeats;
-        observation.ip = context.Rip; ++observation.samples;
+        const Module* sampleModule = moduleContaining(context.Rip, modules);
+        std::wstring modulePath = sampleModule ? sampleModule->path.lexically_normal().wstring() : std::wstring{};
+        observation.ripSequence.observe(context.Rip, sampleModule ? sampleModule->base : 0, modulePath);
+        observation.ip = context.Rip;
+        ++observation.samples;
         log << "RIP=" << location(context.Rip, modules) << " RSP=0x" << std::hex << context.Rsp << " RBP=0x" << context.Rbp
             << " RAX=0x" << context.Rax << " RBX=0x" << context.Rbx << " RCX=0x" << context.Rcx << " RDX=0x" << context.Rdx
             << " RSI=0x" << context.Rsi << " RDI=0x" << context.Rdi << " R8=0x" << context.R8 << " R9=0x" << context.R9
@@ -669,7 +744,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     }
     log << "\nREPEATED_OBSERVATIONS (high CPU can be legitimate work; stable RIP can be an ordinary wait)\n";
     for (const auto& [id, o] : observations)
-        log << "thread=" << id << " samples=" << o.samples << " unchanged_RIP_transitions=" << o.repeats
+        log << "thread=" << id << " samples=" << o.samples << " unchanged_RIP_transitions=" << o.ripSequence.repeats()
             << " total_cpu_delta_100ns=" << o.cpu - o.firstCPU << '\n';
     log << "\nWAIT_CHAINS (live, after snapshots; unsupported locks and access failures are not proof of no deadlock)\n";
     if (state) for (int channel = 1; channel >= 0; --channel) {
@@ -679,30 +754,23 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     log << waitChains(threadIDs);
     log.flush();
     log << "\nCANDIDATE_CONSENSUS (agreement heuristic, not a verdict; confirm by isolation or reproduction)\n";
-    ExternalCrash external = findExternalCrashLog();
-    log << "external_crash_log=" << (external.path.empty() ? "none" : external.path) << '\n';
-    if (external.info.found) {
-        log << "external_fault=" << (external.info.faultModule.empty() ? "unknown-module" : external.info.faultModule)
-            << (external.info.faultOffset.empty() ? "" : "+" + external.info.faultOffset) << " code=0x" << std::hex
-            << external.info.exceptionCode << std::dec << '\n';
-        if (!external.info.stackModules.empty())
-            log << "external_top_frame=" << external.info.stackModules.front() << '\n';
-    }
+    ExternalCrash external = findExternalCrashLog(gameImage, state);
+    log << externalCrashReport(external);
     struct OwnCandidate { std::string module; DWORD thread = 0; unsigned repeats = 0; bool present = false; };
     OwnCandidate own;
     if (state)
         for (int channel = 0; channel < 2; ++channel) {
             DWORD id = static_cast<DWORD>(read(state->thread[channel]));
             auto found = observations.find(id);
-            if (found == observations.end() || found->second.samples < 2) continue;
+            if (found == observations.end() || found->second.samples < 3 || !found->second.ripSequence.repeats()) continue;
             std::string module = moduleBaseName(found->second.ip, lastModules);
-            if (!module.empty() && (!own.present || found->second.repeats > own.repeats))
-                own = {module, id, found->second.repeats, true};
+            if (!module.empty() && (!own.present || found->second.ripSequence.repeats() > own.repeats))
+                own = {module, id, found->second.ripSequence.repeats(), true};
         }
     log << "own_candidate=" << (own.present ? own.module + " (callback thread RIP agreement)" : "none") << '\n';
-    if (external.info.found && own.present) {
+    if (external.matched && external.info.found && own.present) {
         if (external.info.faultModule == own.module) {
-            if (isVictimLocationModule(own.module))
+            if (RuntimeModuleClassifier::isVictimLocation(own.module))
                 log << "consensus=victim-location-caution " << own.module
                     << " (system/game/logger image is usually where corruption lands, not the cause)\n";
             else
@@ -712,10 +780,10 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
             log << "consensus=disagree external=" << external.info.faultModule << " live=" << own.module
                 << " (treat both as leads)\n";
         }
-    } else if (external.info.found) {
+    } else if (external.matched && external.info.found) {
         log << "consensus=external-only " << external.info.faultModule << '\n';
     } else {
-        log << "consensus=no-external-log\n";
+        log << "consensus=no-correlated-external-log\n";
     }
     std::vector<ConsensusThread> consensusThreads;
     if (state)
@@ -724,7 +792,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
             thread.id = id;
             thread.module = moduleBaseName(observation.ip, lastModules);
             thread.samples = observation.samples;
-            thread.repeats = observation.repeats;
+            thread.repeats = observation.ripSequence.repeats();
             thread.cpuDelta = observation.cpu >= observation.firstCPU
                 ? static_cast<unsigned long long>(observation.cpu - observation.firstCPU)
                 : 0;
@@ -732,7 +800,9 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
                 if (id == static_cast<DWORD>(read(state->thread[channel]))) thread.isCallback = true;
             consensusThreads.push_back(std::move(thread));
         }
-    GroupConsensus group = threadGroupConsensus(consensusThreads, isVictimLocationModule);
+    GroupConsensus group = threadGroupConsensus(consensusThreads, [](const std::string& module) {
+        return RuntimeModuleClassifier::isVictimLocation(module);
+    });
     if (group.present)
         log << "thread_group_consensus=" << group.module << " matching_threads=" << group.matching
             << " (synchronization stall likely; an OS lock cycle is not proven, see WAIT_CHAINS)\n";
@@ -742,7 +812,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
         std::string thrownBy;
         for (const auto& [path, identity] : identities)
             if (kept.parameters[3] >= identity.base && kept.parameters[3] - identity.base < identity.size) {
-                thrownBy = buffout::lower(utf8(identity.path.filename().wstring()));
+                thrownBy = buffout::lower(diagnosticPath(identity.path.filename()));
                 break;
             }
         if (!thrownBy.empty())
@@ -751,7 +821,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     }
     log << "\nMODULE_FILE_IDENTITIES (on-disk files; compare to loaded PE/PDB identity above)\n";
     for (const auto& [path, m] : identities)
-        log << utf8(m.path.wstring()) << " version=" << version(m.path) << " disk_sha256=" << sha256(m.path) << '\n';
+        log << diagnosticPath(m.path) << " version=" << version(m.path) << " disk_sha256=" << sha256(m.path) << '\n';
     log << "\ncollection complete\n";
     return sampled && log.good();
 }

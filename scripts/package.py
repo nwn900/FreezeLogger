@@ -1,76 +1,203 @@
-"""Package an already validated local build without publishing or deploying."""
-from pathlib import Path
+"""Package a validated local build without publishing or deploying it."""
+from pathlib import Path, PurePosixPath
+import argparse
 import hashlib
 import json
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 
-root = Path(__file__).resolve().parents[1]
-version = re.search(r'project\(FreezeSentryF4 VERSION ([0-9.]+)', (root / 'CMakeLists.txt').read_text()).group(1)
-stage = root / f'build/package-{version}'
-artifacts = root / 'artifacts'
-digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
-suite = ET.parse(root / f'build/validation-{version}.xml').getroot()
-tests = suite.findall('testcase')
-assert tests and not suite.findall('.//failure') and not suite.findall('.//error'), 'test suite failed'
-assert int(suite.attrib['failures']) == 0
-assert {test.attrib['name'] for test in tests} == {
-    'history-storage', 'real-dxgi-etw', 'engine-context', 'collector-lifetime',
-    'initialization-failures', 'diagnostics', 'oldest-f4se-fallback',
-}
-skipped = [{
-    'test': test.attrib['name'], 'evidence': test.findtext('system-out', '').strip(),
-} for test in tests if test.find('skipped') is not None]
-assert all(entry['test'] == 'real-dxgi-etw' for entry in skipped), 'required tests were skipped'
-rerun = ET.parse(root / f'build/changed-dll-{version}.xml').getroot()
-assert int(rerun.attrib['failures']) == 0 and not rerun.findall('.//failure') and not rerun.findall('.//skipped')
-assert {test.attrib['name'] for test in rerun.findall('testcase')} == {'initialization-failures', 'diagnostics', 'oldest-f4se-fallback'}
-abi = json.loads((root / 'build/sdk-evidence/abi-results.json').read_text())
-assert len(abi) == 71 and all(entry['abi_compile'] == 'passed' for entry in abi)
-with zipfile.ZipFile(artifacts / 'FreezeSentryF4-0.2.0-source.zip') as previous:
-    assert previous.read('src/api.hpp') == (root / 'src/api.hpp').read_bytes(), 'ABI prefix changed since compiled audit'
-for name in ['FreezeSentryF4.dll', 'FreezeSentryF4Watch.exe', 'FreezeSentryF4.pdb', 'FreezeSentryF4Watch.pdb']:
-    assert (stage / 'F4SE/Plugins' / name).read_bytes() == (root / 'build' / name).read_bytes(), f'stale staged {name}'
-assert (stage / 'F4SE/Plugins/FreezeSentryF4.ini').read_bytes() == (root / 'dist/F4SE/Plugins/FreezeSentryF4.ini').read_bytes()
-manifest = stage / 'FreezeSentryF4/SHA256SUMS.txt'
-payload = sorted(path for path in stage.rglob('*') if path.is_file() and path != manifest)
-manifest.write_text(''.join(f'{digest(path)}  {path.relative_to(stage).as_posix()}\n' for path in payload), encoding='utf-8')
-binary = artifacts / f'FreezeSentryF4-{version}-windows-x64.zip'
-source = artifacts / f'FreezeSentryF4-{version}-source.zip'
-with zipfile.ZipFile(binary, 'x', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-    for path in sorted(stage.rglob('*')):
-        if path.is_file(): archive.write(path, path.relative_to(stage).as_posix())
-sources = [root / name for name in ['.gitignore', 'CMakeLists.txt', 'README.md', 'LICENSE']]
-private_work = root / 'docs' / 'agent-work'
-for directory in ['src', 'tests', 'docs', 'dist', 'scripts']:
-    sources += [
-        path for path in (root / directory).rglob('*')
-        if path.is_file() and '__pycache__' not in path.parts
-        and not (directory == 'docs' and private_work in path.parents)
-    ]
-with zipfile.ZipFile(source, 'x', zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-    for path in sorted(sources): archive.write(path, path.relative_to(root).as_posix())
-for artifact in [binary, source]:
-    with zipfile.ZipFile(artifact) as archive:
-        assert archive.testzip() is None
-        for name in archive.namelist():
-            assert archive.read(name) == ((stage if artifact == binary else root) / name).read_bytes(), name
-with zipfile.ZipFile(binary) as archive:
-    for line in archive.read('FreezeSentryF4/SHA256SUMS.txt').decode('utf-8').splitlines():
-        expected, name = line.split('  ', 1)
-        assert hashlib.sha256(archive.read(name)).hexdigest() == expected, name
-(artifacts / f'SHA256SUMS-{version}.txt').write_text(''.join(f'{digest(path)}  {path.name}\n' for path in [binary, source]), encoding='utf-8')
-receipt = {
-    'version': version, 'readiness': 'local game-test candidate',
-    'tests_passed': len(tests) - len(skipped), 'tests_skipped': skipped,
-    'after_final_dll_cleanup_change': 'initialization, diagnostics and oldest-F4SE fallback passed again',
-    'official_sdk_abi_passed': len(abi), 'abi_audit_reused_from': '0.2.0; unchanged api.hpp',
-    'api_prefix_sha256': digest(root / 'src/api.hpp'),
-    'game_startup_qualified': False, 'deployed': False,
-    'named_engine_context_adapter_bundled': 'read-only; exact qualified 1.10.163 hash/PE only',
-    'context_evidence': 'disk/source plus isolated RPM fixtures; no live game pointer claim',
-    'payloads': [{'file': path.name, 'bytes': path.stat().st_size, 'sha256': digest(path)} for path in [binary, source]],
-}
-(artifacts / f'validation-{version}.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
-print(json.dumps(receipt, indent=2))
+
+ROOT = Path(__file__).resolve().parents[1]
+VERSION = re.search(
+    r"project\(FreezeSentryF4 VERSION ([0-9.]+)",
+    (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"),
+).group(1)
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def required(condition: bool, message: str) -> None:
+    if not condition:
+        raise RuntimeError(message)
+
+
+def build_artifact(build: Path, name: str, config: str) -> Path:
+    candidates = [build / name, build / config / name]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise RuntimeError(f"missing build output {name} under {build}")
+
+
+def build_source_archive(archive_path: Path, build: Path, config: str) -> None:
+    cache = (build / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
+    generator = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.+)$", cache, re.M)
+    platform = re.search(r"^CMAKE_GENERATOR_PLATFORM:INTERNAL=(.*)$", cache, re.M)
+    required(generator is not None, f"cannot read CMake generator from {build / 'CMakeCache.txt'}")
+    with zipfile.ZipFile(archive_path) as archive:
+        names = archive.namelist()
+        for name in names:
+            member = PurePosixPath(name)
+            required(not member.is_absolute() and ".." not in member.parts and "\\" not in name,
+                     f"unsafe source archive path: {name}")
+        required("CMakeLists.txt" in names and "fuzz/fuzz_buffout_parser.cpp" in names,
+                 "source archive omits required root or fuzz source")
+        with tempfile.TemporaryDirectory(prefix="fsf4-source-build-") as temporary:
+            source_root = Path(temporary) / "source"
+            source_root.mkdir()
+            archive.extractall(source_root)
+            source_build = Path(temporary) / "build"
+            command = ["cmake", "-S", str(source_root), "-B", str(source_build), "-G", generator.group(1)]
+            if platform and platform.group(1):
+                command += ["-A", platform.group(1)]
+            subprocess.run(command, check=True)
+            subprocess.run(["cmake", "--build", str(source_build), "--config", config, "--parallel"], check=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--build", type=Path, default=ROOT / "build/audit-baseline")
+    parser.add_argument("--config", default="Release")
+    parser.add_argument("--stage", type=Path, default=ROOT / f"build/package-{VERSION}")
+    parser.add_argument("--artifacts", type=Path, default=ROOT / "artifacts")
+    parser.add_argument("--test-report", type=Path, default=ROOT / f"build/validation-{VERSION}.xml",
+                        help="JUnit XML produced by ctest --output-junit")
+    args = parser.parse_args()
+    build = args.build.resolve()
+    stage = args.stage.resolve()
+    artifacts = args.artifacts.resolve()
+    report = args.test_report.resolve()
+
+    inventory = subprocess.run(
+        ["ctest", "--test-dir", str(build), "-C", args.config, "--show-only=json-v1"],
+        check=True, capture_output=True, text=True,
+    )
+    expected_tests = {item["name"] for item in json.loads(inventory.stdout).get("tests", [])}
+    required(bool(expected_tests), "CTest reports no registered tests")
+    required(report.is_file(), f"missing CTest JUnit report: {report}")
+    suite = ET.parse(report).getroot()
+    tests = list(suite.iter("testcase"))
+    actual_tests = {test.attrib.get("name", "") for test in tests}
+    required(len(tests) == len(expected_tests) and actual_tests == expected_tests,
+             f"test receipt set differs from CTest inventory: expected={sorted(expected_tests)} actual={sorted(actual_tests)}")
+    failed = [test.attrib.get("name", "unnamed") for test in tests
+              if test.find("failure") is not None or test.find("error") is not None]
+    required(not failed, f"test failures in receipt: {failed}")
+    skipped = [{
+        "test": test.attrib["name"],
+        "evidence": test.findtext("system-out", "").strip() or
+                    test.find("skipped").attrib.get("message", ""),
+    } for test in tests if test.find("skipped") is not None]
+    required(all(entry["test"] == "real-dxgi-etw" for entry in skipped),
+             "only real-dxgi-etw may be skipped")
+
+    dll = build_artifact(build, "FreezeSentryF4.dll", args.config)
+    watch = build_artifact(build, "FreezeSentryF4Watch.exe", args.config)
+    required(not stage.exists(), f"refusing to replace existing package stage: {stage}")
+    required(stage.is_relative_to(ROOT / "build"), "package stage must stay under the repository build directory")
+    generated_outputs = []
+    try:
+        subprocess.run(["cmake", "--install", str(build), "--prefix", str(stage), "--config", args.config], check=True)
+        plugin_dir = stage / "F4SE/Plugins"
+        required((plugin_dir / "FreezeSentryF4.dll").read_bytes() == dll.read_bytes(), "installed DLL differs from build output")
+        required((plugin_dir / "FreezeSentryF4Watch.exe").read_bytes() == watch.read_bytes(), "installed watcher differs from build output")
+        required((plugin_dir / "FreezeSentryF4.ini").read_bytes() ==
+                 (ROOT / "dist/F4SE/Plugins/FreezeSentryF4.ini").read_bytes(), "installed INI differs from source INI")
+
+        manifest = stage / "FreezeSentryF4/SHA256SUMS.txt"
+        payload = sorted(path for path in stage.rglob("*") if path.is_file() and path != manifest)
+        manifest.write_text("".join(
+            f"{sha256(path)}  {path.relative_to(stage).as_posix()}\n" for path in payload
+        ), encoding="utf-8")
+
+        artifacts.mkdir(parents=True, exist_ok=True)
+        binary = artifacts / f"FreezeSentryF4-{VERSION}-windows-x64.zip"
+        source = artifacts / f"FreezeSentryF4-{VERSION}-source.zip"
+        checksums = artifacts / f"SHA256SUMS-{VERSION}.txt"
+        receipt_path = artifacts / f"validation-{VERSION}.json"
+        for output in (binary, source, checksums, receipt_path):
+            required(not output.exists(), f"refusing to replace existing release artifact: {output}")
+        generated_outputs = [binary, source, checksums, receipt_path]
+
+        with zipfile.ZipFile(binary, "x", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+            for path in sorted(stage.rglob("*")):
+                if path.is_file():
+                    archive.write(path, path.relative_to(stage).as_posix())
+
+        sources = [ROOT / name for name in (".gitignore", "CMakeLists.txt", "README.md", "LICENSE")]
+        private_work = ROOT / "docs" / "agent-work"
+        for directory in ("src", "tests", "docs", "dist", "scripts", "fuzz"):
+            sources.extend(
+                path for path in (ROOT / directory).rglob("*")
+                if path.is_file() and "__pycache__" not in path.parts
+                and not (directory == "docs" and private_work in path.parents)
+            )
+        source_files = sorted(set(sources))
+        required(all(path.is_file() for path in source_files), "source archive input is missing")
+        with zipfile.ZipFile(source, "x", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+            for path in source_files:
+                archive.write(path, path.relative_to(ROOT).as_posix())
+
+        for artifact, source_root in ((binary, stage), (source, ROOT)):
+            with zipfile.ZipFile(artifact) as archive:
+                required(archive.testzip() is None, f"corrupt archive: {artifact}")
+                for name in archive.namelist():
+                    member = Path(*Path(name).parts)
+                    required((source_root / member).is_file(), f"archive contains unexpected path: {name}")
+                    required(archive.read(name) == (source_root / member).read_bytes(), f"archive content mismatch: {name}")
+
+        with zipfile.ZipFile(binary) as archive:
+            for line in archive.read("FreezeSentryF4/SHA256SUMS.txt").decode("utf-8").splitlines():
+                expected, name = line.split("  ", 1)
+                required(hashlib.sha256(archive.read(name)).hexdigest() == expected, f"manifest mismatch: {name}")
+
+        verifier = ROOT / "scripts/verify_release.py"
+        for package_path in (stage, binary):
+            subprocess.run([
+                sys.executable, str(verifier), "--build", str(build), "--config", args.config,
+                "--package", str(package_path),
+            ], check=True)
+
+        build_source_archive(source, build, args.config)
+
+        checksums.write_text("".join(
+            f"{sha256(path)}  {path.name}\n" for path in (binary, source)
+        ), encoding="utf-8")
+        receipt = {
+            "version": VERSION,
+            "readiness": "local game-test candidate",
+            "tests_registered": len(expected_tests),
+            "tests_passed": len(tests) - len(skipped),
+            "tests_skipped": skipped,
+            "game_startup_qualified": False,
+            "gameplay_qualified": False,
+            "deployed": False,
+            "external_crash_correlation": "edition, executable version, process start and five-minute window required",
+            "payloads": [
+                {"file": path.name, "bytes": path.stat().st_size, "sha256": sha256(path)}
+                for path in (binary, source)
+            ],
+        }
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(receipt, indent=2))
+        return 0
+    except Exception:
+        for output in generated_outputs:
+            output.unlink(missing_ok=True)
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print(f"PACKAGE FAILED: {error}", file=sys.stderr)
+        sys.exit(1)

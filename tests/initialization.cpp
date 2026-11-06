@@ -34,7 +34,7 @@ int wmain(int argc, wchar_t** argv) {
     auto blocked = directory / "not-a-directory"; { std::ofstream file(blocked); file << "fixture"; }
     auto writeIni = [&](const std::filesystem::path& output) {
         std::ofstream ini(directory / "FreezeSentryF4.ini");
-        ini << "[FreezeSentryF4]\nFrameMonitoring=0\nContextMonitoring=0\nReportDirectory=" << output.string() << '\n';
+        ini << "[FreezeSentryF4]\nFrameMonitoring=0\nContextMonitoring=0\nMaxReports=1\nReportDirectory=" << output.string() << '\n';
     };
     writeIni(blocked);
     check(!load(&host), "unwritable report directory fails before readiness handshake");
@@ -43,9 +43,19 @@ int wmain(int argc, wchar_t** argv) {
     GetProcessHandleCount(GetCurrentProcess(), &after);
     std::cout << "handshake_retry_handles before=" << before << " after=" << after << '\n';
     check(after == before, "failed-handshake retries release handles");
-    writeIni(directory / "reports");
+    const auto reportDirectory = directory / "reports";
+    writeIni(reportDirectory);
     check(load(&host), "corrected initialization can retry after pre-registration failures");
     check(!load(&host), "registered plugin cannot start another monitor");
+    auto preflight = reportDirectory / ("preflight-" + std::to_string(GetCurrentProcessId()) + ".json");
+    auto deadline = GetTickCount64() + 5000;
+    while (!std::filesystem::exists(preflight) && GetTickCount64() < deadline) Sleep(50);
+    std::ifstream receipt(preflight);
+    std::string contents{std::istreambuf_iterator<char>(receipt), std::istreambuf_iterator<char>()};
+    check(contents.find("\"max_reports_legacy\": 1") != std::string::npos &&
+          contents.find("\"max_freeze_reports\": 1") != std::string::npos &&
+          contents.find("\"max_manual_reports\": 1") != std::string::npos,
+          "legacy MaxReports sets both category limits when overrides are absent");
     std::cout << "PASS: absent helper, unwritable directory, resource cleanup and corrected retry\n";
     ExitProcess(0); // The successfully registered plugin is pinned until this fixture exits.
 }

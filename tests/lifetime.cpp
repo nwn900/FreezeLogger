@@ -6,6 +6,13 @@ namespace {
 void check(bool ok, const char* message) { if (!ok) { std::cerr << "FAIL: " << message << '\n'; ExitProcess(1); } }
 }
 int wmain(int argc, wchar_t** argv) {
+    fs::AwakeDeadline awakeDeadline;
+    awakeDeadline.budget(5000, 30000);
+    check(!awakeDeadline.expired(5000), "awake-time deadline starts unexpired");
+    // An hour of wall-clock sleep does not advance the value supplied to this
+    // deadline. It expires only after the configured awake interval elapses.
+    check(!awakeDeadline.expired(6000), "sleep-inclusive wall time cannot expire collector budget");
+    check(awakeDeadline.expired(35000), "collector budget expires after awake duration");
     if (argc == 2 && std::wstring(argv[1]) == L"--deadline") {
         fs::Lifetime guard(GetCurrentProcess(), 700);
         Sleep(INFINITE); return 1;

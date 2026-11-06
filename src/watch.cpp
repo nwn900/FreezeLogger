@@ -38,7 +38,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     auto* state = static_cast<fs::Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(fs::Shared)));
     if (!state) return 3;
     struct Unmap { void* p; ~Unmap() { UnmapViewOfFile(p); } } unmap{state};
-    if (state->signature != fs::magic || state->version != 5 || !state->pid ||
+    if (state->signature != fs::magic || state->version != 6 || !state->pid ||
         state->timeoutMs < 2000 || state->timeoutMs > 3600000 ||
         state->loadingMs < 2000 || state->loadingMs > 3600000 ||
         state->startupMs < 2000 || state->startupMs > 3600000 ||
@@ -56,14 +56,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         fs::Lifetime lifetime(target, 30000, L"FreezeSentryF4-" + std::to_wstring(state->pid) + L"-" + std::to_wstring(fs::read(state->processCreated)));
         std::array<wchar_t, 32768> exe{};
         DWORD length = static_cast<DWORD>(exe.size());
-        QueryFullProcessImageNameW(target, 0, exe.data(), &length);
-        auto image = std::filesystem::path(exe.data()).filename().wstring();
+        std::filesystem::path gameImage;
+        DWORD gameImageQueryError = ERROR_SUCCESS;
+        if (QueryFullProcessImageNameW(target, 0, exe.data(), &length) && length)
+            gameImage = std::filesystem::path(std::wstring_view(exe.data(), length));
+        else gameImageQueryError = GetLastError();
+        auto image = gameImage.filename().wstring();
         bool vr = _wcsicmp(image.c_str(), L"Fallout4VR.exe") == 0;
         auto folder = state->outputDirectory[0] ? std::filesystem::path(state->outputDirectory) : fs::reportRoot(vr);
         std::filesystem::create_directories(folder);
         auto sessionPath = folder / ("session-" + std::to_string(state->pid) + ".log");
         auto historyPath = folder / ("prehang-" + std::to_string(state->pid) + ".log");
         std::ofstream session(sessionPath, std::ios::trunc);
+        if (gameImageQueryError)
+            session << "game_image_query_error=" << gameImageQueryError << "; external crash logs will not be attributed\n";
         session << "FreezeSentryF4 monitor started. PID=" << state->pid << " runtime=" << state->runtime
                 << " task_monitoring=" << state->taskMonitoring << '\n';
         session.flush();
@@ -75,22 +81,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         session << "DXGI_ETW_status=" << fs::read(state->frameStatus) << " (nonzero: unavailable; no elevation requested)\n";
         session.flush();
         { // Startup compatibility snapshot: versions, thresholds and memory headroom in one machine-readable file.
-            auto escape = [](const std::string& text) {
-                std::string out;
-                for (char c : text) {
-                    if (c == '\\' || c == '"') out += '\\';
-                    out += c;
-                }
-                return out;
-            };
             MEMORYSTATUSEX memory{};
             memory.dwLength = sizeof(memory);
             GlobalMemoryStatusEx(&memory);
             std::ofstream preflight(folder / ("preflight-" + std::to_string(state->pid) + ".json"), std::ios::trunc);
             preflight << "{\n"
                       << "  \"tool\": \"FreezeSentryF4 " << fs::toolVersion << "\",\n"
-                      << "  \"shared_version\": 5,\n"
-                      << "  \"game_image\": \"" << escape(fs::utf8(exe.data())) << "\",\n"
+                      << "  \"shared_version\": 6,\n"
+                      << "  \"game_image\": \"" << fs::jsonEscape(fs::diagnosticPath(gameImage)) << "\",\n"
                       << "  \"pid\": " << state->pid << ",\n"
                       << "  \"runtime\": " << state->runtime << ",\n"
                       << "  \"extender\": " << state->extender << ",\n"
@@ -102,9 +100,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                       << "  \"context_monitoring\": " << state->contextMonitoring << ",\n"
                       << "  \"suppress_background\": " << state->suppressBackground << ",\n"
                       << "  \"foreground_grace_sec\": " << state->foregroundGraceSec << ",\n"
+                      << "  \"max_reports_legacy\": " << state->maxReports << ",\n"
                       << "  \"max_freeze_reports\": " << state->maxFreezeReports << ",\n"
                       << "  \"max_manual_reports\": " << state->maxManualReports << ",\n"
-                      << "  \"output\": \"" << escape(folder.string()) << "\",\n"
+                      << "  \"output\": \"" << fs::jsonEscape(fs::diagnosticPath(folder)) << "\",\n"
                       << "  \"avail_phys_bytes\": " << memory.ullAvailPhys << ",\n"
                       << "  \"avail_commit_bytes\": " << memory.ullAvailPageFile << "\n"
                       << "}\n";
@@ -146,7 +145,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         };
         fs::retain(folder, state->maxFreezeReports, state->maxManualReports, state->storageMB, sessionPath);
         fs::StallGate gate;
-        fs::HangSuppressionState suppression;
+        fs::HangSuppressionPolicy suppression;
         bool suppressionLogged = false;
         LONG lastEvent = -2;
         LONG64 lastEventTime = -1, lastPoll = fs::now(), lastManual = 0;
@@ -194,6 +193,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                             evidence << "exit_code=0x" << std::hex << exitCode << std::dec
                                      << " classification=" << (exitCode ? "nonzero_exit_unclassified" : "zero_exit") << '\n';
                         else evidence << "exit_code=unavailable classification=unknown_exit_status\n";
+                        evidence << fs::externalCrashEvidence(gameImage, state);
                         exceptionJournal.write(evidence);
                         evidence << contextEvidence()
                                  << fs::eventHistory(state) << history.text();
@@ -259,7 +259,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                         if (GetModuleInformation(target, modules[i], &info, sizeof(info)) &&
                             GetModuleFileNameExW(target, modules[i], path.data(), static_cast<DWORD>(path.size())))
                             session << "base=0x" << std::hex << reinterpret_cast<DWORD64>(info.lpBaseOfDll) << " size=0x"
-                                    << info.SizeOfImage << std::dec << ' ' << fs::utf8(path.data()) << '\n';
+                                    << info.SizeOfImage << std::dec << ' ' << fs::diagnosticUtf8(path.data()) << '\n';
                     }
                     session.flush();
                     previousModules = modules; previousModuleBytes = needed;
@@ -309,6 +309,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             }
             DWORD foregroundPID = 0;
             GetWindowThreadProcessId(GetForegroundWindow(), &foregroundPID);
+            frames.current();
             auto frame = fs::read(state->frameTick);
             bool frameAvailable = fs::read(state->frameCount) >= 10 &&
                 (fs::read(state->frameSource) == 2 || fs::read(state->frameStatus) == 0);
@@ -343,6 +344,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             if (fs::now() - contextTick >= 500) { currentContext = context.sample(); contextTick = fs::now(); }
             paused = fs::read(state->phase) != 0 || currentContext.loading() || !fs::read(state->ready);
             timeout = fs::read(state->phase) || currentContext.loading() ? state->loadingMs : state->timeoutMs;
+            frames.current();
             frame = fs::read(state->frameTick);
             frameAvailable = fs::read(state->frameCount) >= 10 &&
                 (fs::read(state->frameSource) == 2 || fs::read(state->frameStatus) == 0);
@@ -357,7 +359,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 DWORD_PTR probeResponse = 0;
                 bool responsive = probe.handle && SendMessageTimeoutW(probe.handle, WM_NULL, 0, 0,
                     SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &probeResponse);
-                auto decision = fs::EvaluateHangSuppression(suppression, state->suppressBackground != 0,
+                auto decision = suppression.evaluate(state->suppressBackground != 0,
                     foregroundPID == state->pid, paused, responsive, t,
                     std::min(main, ui), state->foregroundGraceSec);
                 if (decision.suppress) {
@@ -374,13 +376,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                         session << "tick=" << t << " hang_suppression_lifted\n";
                         session.flush();
                     }
-                    fs::ResetHangSuppression(suppression);
+                    suppression.reset();
                     suppressionLogged = false;
                     collect(reason);
                     lastPoll = fs::now();
                 }
             } else if (!gate.reported) {
-                fs::ResetHangSuppression(suppression);
+                suppression.reset();
                 suppressionLogged = false;
             }
             if (wasReported && !gate.reported) { session << "tick=" << t << " queues recovered\n"; session.flush(); }

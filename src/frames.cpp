@@ -1,5 +1,6 @@
 #include "frames.hpp"
 #include <tdh.h>
+#include <cstring>
 
 namespace fs {
 namespace {
@@ -16,13 +17,40 @@ void WINAPI FrameObserver::receive(EVENT_RECORD* event) {
     catch (...) { if (event && event->UserContext) InterlockedExchange(&static_cast<FrameObserver*>(event->UserContext)->state->frameStatus, ERROR_OUTOFMEMORY); }
 }
 ULONG WINAPI FrameObserver::buffers(EVENT_TRACE_LOGFILEW* log) {
-    if (log && log->EventsLost && log->Context)
-        InterlockedExchange(&static_cast<FrameObserver*>(log->Context)->state->frameStatus, ERROR_INVALID_DATA);
-    return TRUE;
+    if (!log || !log->Context) return FALSE;
+    return static_cast<FrameObserver*>(log->Context)->lossCountersClear() ? TRUE : FALSE;
+}
+bool FrameObserver::lossCountersClear() {
+    DWORD current = GetTickCount();
+    if (lastLossPoll && current - lastLossPoll < 1000) return true;
+    lastLossPoll = current;
+    alignas(EVENT_TRACE_PROPERTIES) std::array<std::byte, sizeof(EVENT_TRACE_PROPERTIES) + 512> query{};
+    auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(query.data());
+    properties->Wnode.BufferSize = static_cast<ULONG>(query.size());
+    properties->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+    const std::size_t bytes = (name.size() + 1) * sizeof(wchar_t);
+    if (properties->LoggerNameOffset + bytes > query.size()) {
+        InterlockedExchange(&state->frameStatus, ERROR_INSUFFICIENT_BUFFER);
+        pending.clear();
+        return false;
+    }
+    memcpy(query.data() + properties->LoggerNameOffset, name.c_str(), bytes);
+    ULONG error = ControlTraceW(0, name.c_str(), properties, EVENT_TRACE_CONTROL_QUERY);
+    if (error != ERROR_SUCCESS) {
+        InterlockedExchange(&state->frameStatus, static_cast<LONG>(error));
+        pending.clear();
+        return false;
+    }
+    if (properties->EventsLost || properties->RealTimeBuffersLost) {
+        InterlockedExchange(&state->frameStatus, ERROR_INVALID_DATA);
+        pending.clear();
+        return false;
+    }
+    return true;
 }
 void FrameObserver::accept(const EVENT_RECORD& event) {
     if (event.EventHeader.ProcessId != state->pid || !IsEqualGUID(event.EventHeader.ProviderId, dxgi) ||
-        event.EventHeader.EventDescriptor.Version != 0 || read(state->frameSource) == 2) return;
+        event.EventHeader.EventDescriptor.Version != 0 || read(state->frameStatus) != ERROR_SUCCESS) return;
     DWORD id = event.EventHeader.EventDescriptor.Id;
     if (id == 42) {
         DWORD flags = 0;
@@ -38,14 +66,18 @@ void FrameObserver::accept(const EVENT_RECORD& event) {
     DWORD flags = found->second; pending.erase(found);
     DWORD result = 0;
     if ((flags & 1) || !property(event, L"Result", result) || result != S_OK) return;
-    InterlockedExchange(&state->frameSource, 1);
-    InterlockedExchange(&state->frameThread, event.EventHeader.ThreadId);
-    InterlockedExchange64(&state->frameTick, now());
-    InterlockedIncrement64(&state->frameCount);
+    LARGE_INTEGER receiveQpc{};
+    if (!QueryPerformanceCounter(&receiveQpc)) return;
+    LONG64 received = now(), generated = 0;
+    if (!frameTickFromQpc(static_cast<std::uint64_t>(event.EventHeader.TimeStamp.QuadPart),
+                          static_cast<std::uint64_t>(receiveQpc.QuadPart),
+                          static_cast<std::uint64_t>(qpcFrequency.QuadPart), received, generated)) return;
+    state->etwFrames.publish(generated, received, event.EventHeader.ThreadId);
 }
 ULONG FrameObserver::start() {
     InterlockedExchange(&state->frameStatus, ERROR_IO_PENDING);
     if (!state->frameMonitoring) return ERROR_NOT_SUPPORTED;
+    if (!QueryPerformanceFrequency(&qpcFrequency) || qpcFrequency.QuadPart <= 0) return ERROR_NOT_SUPPORTED;
     name = L"FreezeSentryF4-" + std::to_wstring(state->pid) + L"-" + std::to_wstring(read(state->processCreated));
     auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buffer.data());
     properties->Wnode.BufferSize = static_cast<ULONG>(buffer.size());
@@ -65,7 +97,7 @@ ULONG FrameObserver::start() {
     if (error) return error;
     EVENT_TRACE_LOGFILEW trace{};
     trace.LoggerName = name.data(); trace.Context = this;
-    trace.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    trace.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
     trace.EventRecordCallback = receive;
     trace.BufferCallback = buffers;
     consumer = OpenTraceW(&trace);
@@ -74,9 +106,20 @@ ULONG FrameObserver::start() {
     worker = std::thread([this] {
         auto error = ProcessTrace(&consumer, 1, nullptr, nullptr);
         // A clean externally stopped session is no longer a progress source.
-        InterlockedExchange(&state->frameStatus, static_cast<LONG>(error ? error : ERROR_BROKEN_PIPE));
+        if (read(state->frameStatus) == ERROR_SUCCESS)
+            InterlockedExchange(&state->frameStatus, static_cast<LONG>(error ? error : ERROR_BROKEN_PIPE));
     });
     return ERROR_SUCCESS;
+}
+FrameSelection FrameObserver::current() const noexcept {
+    const auto etw = state->etwFrames.snapshot();
+    const auto native = state->nativeFrames.snapshot();
+    auto selected = selectFrameProvider(native, etw, read(state->frameStatus) == ERROR_SUCCESS);
+    InterlockedExchange(&state->frameSource, selected.source);
+    InterlockedExchange(&state->frameThread, static_cast<LONG>(selected.sample.thread));
+    InterlockedExchange64(&state->frameTick, selected.sample.tick);
+    InterlockedExchange64(&state->frameCount, selected.sample.count);
+    return selected;
 }
 FrameObserver::~FrameObserver() {
     if (session) ControlTraceW(session, name.c_str(), reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buffer.data()), EVENT_TRACE_CONTROL_STOP);

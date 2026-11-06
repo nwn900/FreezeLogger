@@ -1,5 +1,43 @@
 # Validation history
 
+## FreezeSentryF4 0.3.2 crash correlation and audit, 2026-11-06
+
+The November 5 Buffout log records an access violation at `Fallout4.exe+1C152D6`
+and repeated stack frames at `Fallout4.exe+1B99DCC`. FreezeSentry's prior
+`exit-evidence-12392.log` already recorded PID 12392's nonzero exit and 436
+first-chance access violations, but it did not read/correlate the Buffout log
+when writing exit evidence. The handler had been wired only into freeze capture,
+so the exit report stopped at a generic nonzero exit; the first-chance records
+were not enough to prove the Buffout fault's cause.
+
+Version 0.3.2 now attaches a Buffout record to exit evidence only when its game
+edition and executable version match, its file timestamp follows that process's
+start, and it is within five minutes of observation. Nonmatching records remain
+explicitly `context-only`. Parser bounds, filenames with spaces, UTF-8/JSON
+paths, frame-source priority and ETW QPC timestamps, ETW loss queries, fault-ring
+ordinals, F4SE runtime names, awake-time deadlines, finite foreground grace,
+and active-session retention all have regression coverage. Packaging derives
+its test gate from CTest's inventory, includes the fuzz source, and validates the
+INI inside the package. Small service/policy objects own the suppression,
+correlation, frame publication, runtime classification, and lifetime rules.
+
+The `RelWithDebInfo` build completed. CTest passed 12 of 13 tests; only
+`real-dxgi-etw` skipped because ETW startup returned status 5. The real ETW
+provider test is therefore not qualified on this machine. Both the package
+directory and Windows ZIP passed `scripts/verify_release.py`; the source ZIP
+contains `fuzz/`.
+
+A direct `f4se_loader.exe` launch from the installed Fallout 4 directory loaded
+the deployed 0.3.2 DLL, created a matching watcher/session/preflight, and enabled
+the qualified read-only 1.10.163 context adapter. The game was closed from the
+main menu without loading a save. The resulting exit report recorded exit code
+0 and labeled the November 5 crash log `context-only` / `before-process-start`.
+This verifies startup and exit-report wiring, not gameplay, save integrity, or
+live crash reproduction. The DLL, watcher, PDBs and INI in the requested Vortex
+mod folder match the installed `Data/F4SE/Plugins` hardlinks by SHA-256. The
+predeployment files are backed up at
+`deployments/2026-11-06-pre-0.3.2-vortex`.
+
 ## FreezeSentryF4 0.3.1 crash-capture update, 2026-11-05
 
 The plugin and collector configured and built in `RelWithDebInfo` with Visual

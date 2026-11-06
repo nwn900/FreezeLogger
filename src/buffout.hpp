@@ -11,11 +11,15 @@
 #include <cstdint>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs {
 struct BuffoutCrashInfo {
     bool found = false; // A fault line was recognized.
+    enum class Edition : unsigned char { Unknown, Fallout4, Fallout4VR };
+    Edition edition = Edition::Unknown;
+    std::string gameVersion;
     std::string exceptionName;
     std::uint32_t exceptionCode = 0;
     std::uint64_t faultAddress = 0;
@@ -38,26 +42,35 @@ inline std::string trim(const std::string& line) {
 // Parses up to 16 hex digits; returns false on empty/invalid input or overflow.
 inline bool parseHex(const std::string& text, std::size_t& at, std::uint64_t& value) {
     std::uint64_t result = 0;
+    std::size_t cursor = at;
     std::size_t digits = 0;
-    while (at < text.size() && digits < 16) {
-        char c = text[at];
+    while (cursor < text.size() && digits < 16) {
+        char c = text[cursor];
         unsigned digit = c >= '0' && c <= '9' ? static_cast<unsigned>(c - '0')
             : c >= 'a' && c <= 'f' ? static_cast<unsigned>(c - 'a' + 10)
             : c >= 'A' && c <= 'F' ? static_cast<unsigned>(c - 'A' + 10)
             : 256u;
         if (digit > 15) break;
         result = result * 16 + digit;
-        ++at;
+        ++cursor;
         ++digits;
     }
     if (!digits) return false;
+    if (cursor < text.size()) {
+        char c = text[cursor];
+        bool extraHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (extraHex) return false;
+    }
+    at = cursor;
     value = result;
     return true;
 }
-// Finds the first image token (.dll/.exe/.asi, any case) at or after `from`
-// and returns its lowercase basename. Empty when absent.
+// Reads the image following an address. Spaces are valid filename characters;
+// path separators, rather than whitespace, identify the basename boundary.
 inline std::string imageAfter(const std::string& line, std::size_t from) {
     static const char* extensions[] = {".dll", ".exe", ".asi"};
+    while (from < line.size() && (line[from] == ' ' || line[from] == '\t' || line[from] == '(' ||
+                                   line[from] == '[' || line[from] == '"' || line[from] == '\'')) ++from;
     for (std::size_t i = from; i < line.size(); ++i) {
         for (const char* extension : extensions) {
             std::size_t length = 4;
@@ -66,18 +79,22 @@ inline std::string imageAfter(const std::string& line, std::size_t from) {
             for (std::size_t k = 0; k < length; ++k)
                 if (std::tolower(static_cast<unsigned char>(line[i + k])) != extension[k]) { match = false; break; }
             if (!match) continue;
-            std::size_t end = i;
-            while (end > 0) {
-                char c = line[end - 1];
-                if (c == '\\' || c == '/' || c == ':' || c == '"' || c == '\'' || c == ' ' || c == '\t' ||
-                    c == '(' || c == '[' || c == '<' || c == '|') break;
-                --end;
-            }
-            if (end >= i) continue;
-            return lower(line.substr(end, i - end + length));
+            std::size_t begin = from;
+            for (std::size_t cursor = from; cursor < i; ++cursor)
+                if (line[cursor] == '\\' || line[cursor] == '/') begin = cursor + 1;
+            std::size_t end = i + length;
+            while (end > begin && (line[end - 1] == ' ' || line[end - 1] == '\t' || line[end - 1] == ')' ||
+                                   line[end - 1] == ']' || line[end - 1] == '"' || line[end - 1] == '\'')) --end;
+            if (begin >= end) continue;
+            return lower(line.substr(begin, end - begin));
         }
     }
     return {};
+}
+inline std::string normalizeVersion(std::string value) {
+    value = trim(value);
+    while (value.size() > 1 && value.ends_with(".0")) value.resize(value.size() - 2);
+    return value;
 }
 inline std::uint32_t exceptionCodeFor(const std::string& name) {
     std::string upper = name;
@@ -102,6 +119,21 @@ inline BuffoutCrashInfo parseBuffoutCrashLog(const std::string& text, const std:
         std::string line = buffout::trim(text.substr(at, end - at));
         at = end + 1;
         if (line.size() > 4096) continue; // Hostile line; markers never need more.
+        std::string lowerLine = buffout::lower(line);
+        const std::pair<const char*, BuffoutCrashInfo::Edition> editions[]{
+            {"fallout 4 vr v", BuffoutCrashInfo::Edition::Fallout4VR},
+            {"fallout4vr v", BuffoutCrashInfo::Edition::Fallout4VR},
+            {"fallout 4 v", BuffoutCrashInfo::Edition::Fallout4},
+            {"fallout4 v", BuffoutCrashInfo::Edition::Fallout4},
+        };
+        for (const auto& [prefix, edition] : editions) {
+            std::size_t prefixSize = std::char_traits<char>::length(prefix);
+            if (lowerLine.starts_with(prefix)) {
+                info.edition = edition;
+                info.gameVersion = buffout::trim(line.substr(prefixSize));
+                break;
+            }
+        }
         if (!info.found) {
             std::size_t marker = line.find("Unhandled exception");
             if (marker != std::string::npos) {
@@ -129,8 +161,8 @@ inline BuffoutCrashInfo parseBuffoutCrashLog(const std::string& text, const std:
                             }
                         }
                     }
-                } else {
-                    info.faultModule = buffout::imageAfter(line, marker);
+                } else if (close != std::string::npos) {
+                    info.faultModule = buffout::imageAfter(line, close + 1);
                 }
                 if (!info.exceptionName.empty() || info.faultAddress || !info.faultModule.empty()) info.found = true;
                 continue;
@@ -142,7 +174,12 @@ inline BuffoutCrashInfo parseBuffoutCrashLog(const std::string& text, const std:
                 if (!info.stackModules.empty()) inStack = false;
                 continue;
             }
-            std::string module = buffout::imageAfter(line, 0);
+            std::size_t address = line.find("0x");
+            if (address == std::string::npos) address = line.find("0X");
+            std::size_t moduleStart = address == std::string::npos ? line.size() : address + 2;
+            std::uint64_t ignoredAddress = 0;
+            if (address != std::string::npos && !buffout::parseHex(line, moduleStart, ignoredAddress)) continue;
+            std::string module = address == std::string::npos ? std::string{} : buffout::imageAfter(line, moduleStart);
             if (!module.empty() && info.stackModules.size() < 16) info.stackModules.push_back(module);
             if (info.stackModules.size() >= 16) inStack = false;
         }
@@ -151,4 +188,46 @@ inline BuffoutCrashInfo parseBuffoutCrashLog(const std::string& text, const std:
     info.sourcePath = sourcePath;
     return info;
 }
+
+struct CrashLogSession {
+    BuffoutCrashInfo::Edition edition = BuffoutCrashInfo::Edition::Unknown;
+    std::string gameVersion;
+    std::uint64_t processStartedFileTime = 0;
+    std::uint64_t observedFileTime = 0;
+    std::uint64_t maximumAgeMs = 5 * 60 * 1000;
+};
+struct CrashLogMatch {
+    bool matched = false;
+    std::uint64_t ageMs = 0;
+    std::string reason;
+};
+
+// Correlates a parsed crash log to one game process. This deliberately fails
+// closed so old logs and a different runtime remain context, never consensus.
+class CrashLogCorrelator final {
+public:
+    explicit CrashLogCorrelator(CrashLogSession session) : session_(std::move(session)) {}
+
+    CrashLogMatch assess(const BuffoutCrashInfo& crash, std::uint64_t writtenFileTime) const {
+        if (!crash.found) return {false, 0, "not-a-crash-log"};
+        if (session_.edition == BuffoutCrashInfo::Edition::Unknown ||
+            crash.edition == BuffoutCrashInfo::Edition::Unknown) return {false, 0, "game-edition-unknown"};
+        if (crash.edition != session_.edition) return {false, 0, "game-edition-mismatch"};
+        if (session_.gameVersion.empty() || session_.gameVersion == "unavailable" || crash.gameVersion.empty())
+            return {false, 0, "game-version-unknown"};
+        if (buffout::normalizeVersion(crash.gameVersion) != buffout::normalizeVersion(session_.gameVersion))
+            return {false, 0, "game-version-mismatch"};
+        if (!session_.processStartedFileTime || writtenFileTime < session_.processStartedFileTime)
+            return {false, 0, "before-process-start"};
+        constexpr std::uint64_t futureSkew = 30ULL * 10000000ULL;
+        if (writtenFileTime > session_.observedFileTime && writtenFileTime - session_.observedFileTime > futureSkew)
+            return {false, 0, "future-file-time"};
+        std::uint64_t age = session_.observedFileTime > writtenFileTime
+            ? (session_.observedFileTime - writtenFileTime) / 10000ULL : 0;
+        if (age > session_.maximumAgeMs) return {false, age, "outside-session-correlation-window"};
+        return {true, age, "same-edition-version-session-and-time"};
+    }
+private:
+    CrashLogSession session_;
+};
 } // namespace fs

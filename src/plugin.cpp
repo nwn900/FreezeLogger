@@ -191,8 +191,10 @@ bool load(const fs::Host* host) {
     state->startupMs = setting(ini, L"StartupTimeoutSeconds", 180, 2, 3600) * 1000;
     state->probeMs = setting(ini, L"ProbeMilliseconds", 250, 50, 5000);
     state->maxReports = setting(ini, L"MaxReports", 10, 1, 100);
-    state->maxFreezeReports = setting(ini, L"MaxFreezeReports", 10, 1, 100);
-    state->maxManualReports = setting(ini, L"MaxManualReports", 10, 1, 100);
+    // Older INIs exposed only MaxReports. Category-specific limits override
+    // that compatibility default when present.
+    state->maxFreezeReports = setting(ini, L"MaxFreezeReports", state->maxReports, 1, 100);
+    state->maxManualReports = setting(ini, L"MaxManualReports", state->maxReports, 1, 100);
     state->suppressBackground = setting(ini, L"SuppressBackgroundHang", 1, 0, 1);
     state->foregroundGraceSec = setting(ini, L"ForegroundGraceSeconds", 10, 0, 300);
     state->writeDump = setting(ini, L"WriteMinidump", 1, 0, 1);
@@ -252,11 +254,8 @@ __declspec(dllexport) bool FreezeSentryF4_RecordEvent(const fs::EventData* input
 __declspec(dllexport) bool FreezeSentryF4_FramePulse() {
     PreserveError preserve;
     if (!state || fs::read(state->ready) != 1) return false;
-    InterlockedExchange(&state->frameSource, 2);
-    InterlockedExchange(&state->frameThread, GetCurrentThreadId());
-    InterlockedExchange64(&state->frameTick, fs::now());
-    InterlockedIncrement64(&state->frameCount);
-    return true;
+    auto tick = fs::now();
+    return state->nativeFrames.publish(tick, tick, GetCurrentThreadId());
 }
 __declspec(dllexport) bool F4SEPlugin_Query(const fs::Host* host, fs::Info* info) {
     if (!info) return false;

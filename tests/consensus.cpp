@@ -1,5 +1,6 @@
 // Unit tests for the thread-group consensus rule (src/consensus.hpp).
 #include "../src/consensus.hpp"
+#include "../src/runtime.hpp"
 #include <windows.h>
 #include <iostream>
 
@@ -21,6 +22,25 @@ fs::ConsensusThread thread(std::uint32_t id, const char* module, unsigned long l
 } // namespace
 
 int wmain() {
+    check(fs::RuntimeModuleClassifier::isVictimLocation("f4se_1_10_163.dll"),
+          "versioned Fallout 4 runtime DLL is excluded from blame heuristic");
+    check(fs::RuntimeModuleClassifier::isVictimLocation("f4sevr_1_2_72.dll"),
+          "versioned VR runtime DLL is excluded from blame heuristic");
+    {
+        fs::RipSequence run;
+        run.observe(10, 100, L"A.dll"); run.observe(10, 100, L"A.dll"); run.observe(10, 100, L"A.dll");
+        check(run.repeats() == 2, "A,A,A retains repeats for final RIP");
+        run.observe(20, 100, L"A.dll");
+        check(run.repeats() == 0, "A,A,B does not transfer A repeats to B");
+        run.observe(30, 100, L"A.dll"); run.observe(30, 100, L"A.dll");
+        check(run.repeats() == 1, "A,B,B counts only B repeats");
+        run.observe(10, 100, L"A.dll");
+        check(run.repeats() == 0, "A,B,A does not transfer earlier repeats");
+        run.observe(10, 200, L"Other.dll");
+        check(run.repeats() == 0, "module identity change resets the run");
+        run.reset();
+        check(run.repeats() == 0, "thread identity reuse can reset its RIP run");
+    }
     {
         // The live 16:44 case: 174 threads parked with zero CPU in ntdll.
         std::vector<fs::ConsensusThread> parked;

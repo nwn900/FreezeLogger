@@ -104,7 +104,7 @@ void retain(const std::filesystem::path& folder, unsigned freezeLimit, unsigned 
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return;
     struct File { std::filesystem::path path; std::uintmax_t size; std::filesystem::file_time_type time; bool dump; };
     std::vector<File> files;
-    static const std::regex owned(R"(((freeze|manual)-[0-9]{8}-[0-9]{6}-[0-9]{3}-[0-9]+\.(log|dmp|dmp\.partial)|(session|exit-evidence|prehang)-[0-9]+\.log|preflight-[0-9]+\.json))");
+    static const std::wregex owned(LR"(((freeze|manual)-[0-9]{8}-[0-9]{6}-[0-9]{3}-[0-9]+\.(log|dmp|dmp\.partial)|(session|exit-evidence|prehang)-[0-9]+\.log|prehang-[0-9]+\.log\.partial|preflight-[0-9]+\.json))");
     std::error_code error;
     auto iterator = std::filesystem::directory_iterator(folder, error);
     const auto iteratorEnd = std::filesystem::directory_iterator{};
@@ -112,54 +112,85 @@ void retain(const std::filesystem::path& folder, unsigned freezeLimit, unsigned 
         const auto& file = *iterator;
         auto path = file.path(); DWORD attr = GetFileAttributesW(path.c_str());
         if (attr == INVALID_FILE_ATTRIBUTES || (attr & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
-            !std::regex_match(path.filename().string(), owned)) continue;
+            !std::regex_match(path.filename().wstring(), owned)) continue;
         auto size = file.file_size(error); if (error) { error.clear(); continue; }
         auto time = file.last_write_time(error); if (error) { error.clear(); continue; }
-        files.push_back({path, size, time, path.extension() == ".dmp" || path.extension() == ".partial"});
+        files.push_back({path, size, time, path.extension() == L".dmp" || path.extension() == L".partial"});
     }
     std::sort(files.begin(), files.end(), [](const File& a, const File& b) { return a.time < b.time; });
     std::vector<std::filesystem::path> freezeLogs, manualLogs;
     for (const auto& file : files)
-        if (file.path.extension() == ".log") {
-            auto name = file.path.filename().string();
-            if (name.starts_with("freeze-")) freezeLogs.push_back(file.path);
-            else if (name.starts_with("manual-")) manualLogs.push_back(file.path);
+        if (file.path.extension() == L".log") {
+            auto name = file.path.filename().wstring();
+            if (name.starts_with(L"freeze-")) freezeLogs.push_back(file.path);
+            else if (name.starts_with(L"manual-")) manualLogs.push_back(file.path);
         }
-    auto current = protectedFile.stem().string();
-    auto pid = current.starts_with("session-") ? current.substr(8) : std::string{};
+    auto current = protectedFile.stem().wstring();
+    auto pid = current.starts_with(L"session-") ? current.substr(8) : std::wstring{};
     // A live collector holds its session without FILE_SHARE_DELETE. Preserve all
     // its evidence, including captures, while another collector runs retention.
-    std::set<std::string> activePids;
+    std::set<std::wstring> activePids;
     for (const auto& file : files) {
-        auto name = file.path.filename().string();
-        if (!name.starts_with("session-")) continue;
+        auto name = file.path.filename().wstring();
+        if (!name.starts_with(L"session-")) continue;
         Handle deletionProbe(CreateFileW(file.path.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
         auto code = GetLastError();
         if (deletionProbe.value == INVALID_HANDLE_VALUE && (code == ERROR_SHARING_VIOLATION || code == ERROR_ACCESS_DENIED))
-            activePids.insert(file.path.stem().string().substr(8));
+            activePids.insert(file.path.stem().wstring().substr(8));
     }
-    std::map<std::string, std::filesystem::path> liveNewest;
-    for (const auto& active : activePids)
-        for (const auto* category : {&freezeLogs, &manualLogs})
-            for (const auto& incident : *category)
-                if (incident.filename().string().ends_with("-" + active + ".log")) liveNewest[active] = incident;
+    struct LiveIncident { std::filesystem::file_time_type time; std::filesystem::path path; };
+    std::map<std::wstring, LiveIncident> liveNewest;
+    for (const auto& file : files) {
+        auto name = file.path.filename().wstring();
+        for (const auto& active : activePids) {
+            if (!name.starts_with(L"freeze-") && !name.starts_with(L"manual-")) continue;
+            if (!name.ends_with(L"-" + active + L".log")) continue;
+            auto found = liveNewest.find(active);
+            if (found == liveNewest.end() || file.time > found->second.time)
+                liveNewest[active] = {file.time, file.path};
+        }
+    }
     auto newestFreeze = freezeLogs.empty() ? std::filesystem::path{} : freezeLogs.back();
     auto newestManual = manualLogs.empty() ? std::filesystem::path{} : manualLogs.back();
+    auto belongsToActiveCollector = [&](const std::filesystem::path& path) {
+        const auto name = path.filename().wstring();
+        for (const auto& active : activePids)
+            if (name.ends_with(L"-" + active + L".log")) return true;
+        return false;
+    };
     auto protectedPath = [&](const std::filesystem::path& path) {
-        auto name = path.filename().string();
+        auto name = path.filename().wstring();
         for (const auto& active : activePids) {
-            if (name == "session-" + active + ".log" || name == "prehang-" + active + ".log" ||
-                name == "exit-evidence-" + active + ".log" || name == "preflight-" + active + ".json") return true;
+            if (name == L"session-" + active + L".log" || name == L"prehang-" + active + L".log" ||
+                name == L"prehang-" + active + L".log.partial" || name == L"exit-evidence-" + active + L".log" ||
+                name == L"preflight-" + active + L".json") return true;
             auto latest = liveNewest.find(active);
             if (latest != liveNewest.end()) {
-                auto dump = latest->second; dump.replace_extension(".dmp");
+                auto incident = latest->second.path;
+                auto dump = incident; dump.replace_extension(".dmp");
                 auto partial = dump; partial += ".partial";
-                if (path == latest->second || path == dump || path == partial) return true;
+                if (path == incident || path == dump || path == partial) return true;
             }
         }
-        return path == protectedFile || (!pid.empty() && (name == "prehang-" + pid + ".log" || name == "exit-evidence-" + pid + ".log" ||
-            name == "preflight-" + pid + ".json")) || path == newestFreeze || path == newestManual;
+        // A live session's newest incident is selected across both categories
+        // above. Do not additionally pin an older manual log just because it is
+        // the newest manual entry when a newer freeze report exists.
+        bool categoryNewest = path == newestFreeze || path == newestManual;
+        if (categoryNewest && belongsToActiveCollector(path)) {
+            bool selectedForLiveSession = false;
+            for (const auto& active : activePids) {
+                auto latest = liveNewest.find(active);
+                if (latest != liveNewest.end() && latest->second.path == path) {
+                    selectedForLiveSession = true;
+                    break;
+                }
+            }
+            if (!selectedForLiveSession) categoryNewest = false;
+        }
+        return path == protectedFile || (!pid.empty() && (name == L"prehang-" + pid + L".log" ||
+            name == L"prehang-" + pid + L".log.partial" || name == L"exit-evidence-" + pid + L".log" ||
+            name == L"preflight-" + pid + L".json")) || categoryNewest;
     };
     auto pruneCategory = [&](std::vector<std::filesystem::path>& category, unsigned limit) {
         if (!limit) return;
@@ -176,7 +207,7 @@ void retain(const std::filesystem::path& folder, unsigned freezeLimit, unsigned 
     pruneCategory(freezeLogs, freezeLimit);
     pruneCategory(manualLogs, manualLimit);
     auto now = std::filesystem::file_time_type::clock::now();
-    for (auto& file : files) if (file.path.extension() == ".partial" && !protectedPath(file.path) && now - file.time > std::chrono::hours(1)) {
+    for (auto& file : files) if (file.path.extension() == L".partial" && !protectedPath(file.path) && now - file.time > std::chrono::hours(1)) {
         if (std::filesystem::remove(file.path, error)) file.size = 0;
     }
     std::uintmax_t total = 0; for (const auto& file : files) total += file.size;

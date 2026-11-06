@@ -1,11 +1,13 @@
-# 0.3.1 candidate: live game checks
+# 0.3.2 candidate: live game checks
 
-The direct F4SE startup smoke test is complete. It confirmed plugin load,
-collector startup, `task_monitoring=1`, the qualified 1.10.163 context adapter,
-and normal watcher shutdown. DXGI ETW was unavailable (`status=5`). No save
-selection or gameplay interaction occurred; no freeze/crash was reproduced,
-and no save-integrity claim is made. Host/ABI/disk tests do not establish
-gameplay behavior.
+The direct F4SE startup smoke test completed on 2026-11-06 with Fallout 4
+1.10.163 and F4SE 0.6.23. The 0.3.2 plugin loaded, wrote `shared_version=6`
+preflight data, started its watcher, and passed the qualified 1.10.163 context
+adapter. The game closed from the main menu with exit code 0; the watcher wrote
+exit evidence and stopped normally. It saw the November 5 Buffout log as
+`context-only` with `before-process-start`, which is correct for this separate
+process. DXGI ETW remained unavailable (`status=5`). No save was loaded, no real
+crash/freeze was reproduced, and no save-integrity claim is made.
 
 ## Remaining copied-save checks
 
@@ -32,10 +34,11 @@ Keep the ordinary crash logger enabled. Use a copied save/profile for play tests
    files, its next deployment can restore them; update/rollback must account for
    its staging winner as well as the direct game copy.
 
-The actual crash observer has only been exercised by a synthetic, handled
-exception in the isolated diagnostics process; no Fallout 4 crash was triggered.
-The UI screenshot service timed out twice during the smoke test, so the menu
-state was not visually checked.
+The Buffout correlation unit tests exercise the recorded crash-log header and
+fault format, including same-session acceptance and rejection of stale,
+cross-edition, cross-version and pre-process logs. The game smoke test confirms
+exit-report wiring and safe rejection of an unrelated old log; it does not
+simulate a Fallout 4 crash.
 
 Other Fallout 4 runtimes/VR need their own startup/gameplay checks. The native
 context adapter is intentionally unavailable on unqualified images; this must

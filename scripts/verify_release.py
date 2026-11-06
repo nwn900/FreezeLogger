@@ -1,93 +1,121 @@
 #!/usr/bin/env python3
-"""Release gate for FreezeSentryF4: a package tree must match build outputs.
-
-Catches stale-binary packaging (a rebuilt Watch paired with an old DLL, or an
-old binary shipped under a release name) and INI/Code config drift.
-
-Usage:
-    python scripts/verify_release.py --build build --package <dir-or-zip>
-
-Checks:
-    1. Required files exist in the package (DLL, Watch EXE, INI; PDBs warn).
-    2. DLL and EXE are byte-identical (SHA-256) to the build outputs.
-    3. Every setting() key read by src/plugin.cpp is documented in dist INI.
-"""
+"""Verify that a release directory or ZIP contains the built binaries and INI."""
 import argparse
 import hashlib
 import re
 import sys
-import tempfile
 import zipfile
 from pathlib import Path
 
-REQUIRED = [
+
+REQUIRED = (
     "F4SE/Plugins/FreezeSentryF4.dll",
     "F4SE/Plugins/FreezeSentryF4Watch.exe",
     "F4SE/Plugins/FreezeSentryF4.ini",
-]
-PDBS = [
+)
+PDBS = (
     "F4SE/Plugins/FreezeSentryF4.pdb",
     "F4SE/Plugins/FreezeSentryF4Watch.pdb",
-]
+)
 BUILD_BINARIES = {
     "F4SE/Plugins/FreezeSentryF4.dll": "FreezeSentryF4.dll",
     "F4SE/Plugins/FreezeSentryF4Watch.exe": "FreezeSentryF4Watch.exe",
 }
 
 
-def sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-def main():
+def build_file(build: Path, name: str, config: str) -> Path:
+    for candidate in (build / name, build / config / name):
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(f"missing build output: {name} under {build}")
+
+
+def package_reader(package: Path):
+    if package.is_dir():
+        def read(name: str) -> bytes:
+            return (package / Path(*name.split("/"))).read_bytes()
+
+        def exists(name: str) -> bool:
+            return (package / Path(*name.split("/"))).is_file()
+
+        return read, exists
+    if not package.is_file() or not zipfile.is_zipfile(package):
+        raise FileNotFoundError(f"package is not a directory or ZIP: {package}")
+    archive = zipfile.ZipFile(package)
+    names = archive.namelist()
+
+    def member(name: str) -> str:
+        matches = [entry for entry in names if entry == name or entry.endswith("/" + name)]
+        if len(matches) != 1:
+            raise FileNotFoundError(f"expected one packaged entry {name}, found {len(matches)}")
+        return matches[0]
+
+    def read(name: str) -> bytes:
+        return archive.read(member(name))
+
+    def exists(name: str) -> bool:
+        try:
+            member(name)
+            return True
+        except FileNotFoundError:
+            return False
+
+    return read, exists
+
+
+def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--build", required=True, help="CMake build directory")
-    parser.add_argument("--package", required=True, help="Package directory or zip")
+    parser.add_argument("--build", required=True, type=Path, help="CMake build directory")
+    parser.add_argument("--package", required=True, type=Path, help="Package directory or ZIP")
+    parser.add_argument("--config", default="Release", help="CMake configuration")
     parser.add_argument("--src", default=Path(__file__).resolve().parent.parent,
-                        help="Repository root (for src/plugin.cpp and dist INI)")
+                        type=Path, help="Repository root")
     args = parser.parse_args()
     failures, warnings = [], []
-
-    package = Path(args.package)
-    if package.is_file() and zipfile.is_zipfile(package):
-        expanded = Path(tempfile.mkdtemp(prefix="fs4-release-"))
-        with zipfile.ZipFile(package) as archive:
-            archive.extractall(expanded)
-        # A zip may wrap everything in one top-level folder.
-        inner = [child for child in expanded.iterdir() if child.is_dir()]
-        package = inner[0] if len(inner) == 1 and not (expanded / "F4SE").exists() else expanded
-    if not package.is_dir():
-        print(f"FAIL: package is not a directory or zip: {args.package}")
-        return 1
+    package = args.package.resolve()
+    read, exists = package_reader(package)
 
     for name in REQUIRED:
-        if not (package / name).is_file():
+        if not exists(name):
             failures.append(f"missing required file: {name}")
     for name in PDBS:
-        if not (package / name).is_file():
+        if not exists(name):
             warnings.append(f"missing debug symbols: {name}")
 
-    build = Path(args.build)
-    for package_name, build_name in BUILD_BINARIES.items():
-        package_file, build_file = package / package_name, build / build_name
-        if not build_file.is_file():
-            failures.append(f"missing build output: {build_file}")
-        elif package_file.is_file() and sha256(package_file) != sha256(build_file):
-            failures.append(f"stale binary: {package_name} differs from build output")
+    build = args.build.resolve()
+    for packaged_name, build_name in BUILD_BINARIES.items():
+        try:
+            built = build_file(build, build_name, args.config).read_bytes()
+            if exists(packaged_name) and sha256(read(packaged_name)) != sha256(built):
+                failures.append(f"stale binary: {packaged_name} differs from build output")
+        except FileNotFoundError as error:
+            failures.append(str(error))
 
-    plugin = Path(args.src) / "src" / "plugin.cpp"
-    dist_ini = Path(args.src) / "dist" / "F4SE" / "Plugins" / "FreezeSentryF4.ini"
-    if plugin.is_file() and dist_ini.is_file():
-        keys = set(re.findall(r'setting\s*\(\s*ini\s*,\s*L"([^"]+)"', plugin.read_text()))
-        documented = set(re.findall(r"^([A-Za-z0-9]+)\s*=", dist_ini.read_text(), re.M))
+    source = args.src.resolve()
+    plugin = source / "src/plugin.cpp"
+    dist_ini = source / "dist/F4SE/Plugins/FreezeSentryF4.ini"
+    packaged_ini_name = "F4SE/Plugins/FreezeSentryF4.ini"
+    if plugin.is_file() and dist_ini.is_file() and exists(packaged_ini_name):
+        packaged_ini = read(packaged_ini_name)
+        expected_ini = dist_ini.read_bytes()
+        if packaged_ini != expected_ini:
+            failures.append("packaged INI differs from canonical dist INI")
+        try:
+            ini_text = packaged_ini.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            failures.append("packaged INI is not valid UTF-8")
+            ini_text = ""
+        keys = set(re.findall(r'setting\s*\(\s*ini\s*,\s*L"([^"]+)"',
+                              plugin.read_text(encoding="utf-8")))
+        documented = set(re.findall(r"^([A-Za-z0-9]+)\s*=", ini_text, re.M))
         for key in sorted(keys - documented):
-            failures.append(f"INI key read by plugin.cpp but undocumented in dist INI: {key}")
+            failures.append(f"INI key read by plugin.cpp but absent from packaged INI: {key}")
     else:
-        warnings.append("skipped INI/code drift check (plugin.cpp or dist INI absent)")
+        failures.append("cannot verify the packaged INI against code and canonical dist INI")
 
     for warning in warnings:
         print(f"WARN: {warning}")
@@ -95,9 +123,13 @@ def main():
         for failure in failures:
             print(f"FAIL: {failure}")
         return 1
-    print(f"PASS: release gate ({len(REQUIRED)} files, hashes match, INI documents code keys)")
+    print(f"PASS: release gate ({len(REQUIRED)} packaged files, build hashes and packaged INI verified)")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        sys.exit(1)

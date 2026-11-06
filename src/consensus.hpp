@@ -8,9 +8,31 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace fs {
+// Tracks only a consecutive run for one exact address and loaded image.
+class RipSequence final {
+public:
+    void observe(std::uint64_t address, std::uint64_t moduleBase, std::wstring_view modulePath) {
+        bool same = hasPrevious_ && address == previousAddress_ && moduleBase == previousBase_ &&
+                    modulePath == previousPath_;
+        repeats_ = same ? repeats_ + 1 : 0;
+        previousAddress_ = address;
+        previousBase_ = moduleBase;
+        previousPath_.assign(modulePath);
+        hasPrevious_ = true;
+    }
+    unsigned repeats() const noexcept { return repeats_; }
+    void reset() { *this = {}; }
+private:
+    bool hasPrevious_ = false;
+    std::uint64_t previousAddress_ = 0, previousBase_ = 0;
+    std::wstring previousPath_;
+    unsigned repeats_ = 0;
+};
+
 struct ConsensusThread {
     std::uint32_t id = 0;
     std::string module; // Lowercase basename of the stable sampled RIP module.

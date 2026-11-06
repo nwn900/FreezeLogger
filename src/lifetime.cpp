@@ -12,11 +12,13 @@ Lifetime::Lifetime(HANDLE process, DWORD idleMs, std::wstring ownedTraceName)
     worker = std::thread([this] {
         HANDLE handles[]{stop.value, target.value};
         LONG64 exitedAt = 0;
+        bool targetExited = false;
         for (;;) {
-            DWORD wait = WaitForMultipleObjects(exitedAt ? 1 : 2, handles, FALSE, 200);
+            DWORD wait = WaitForMultipleObjects(targetExited ? 1 : 2, handles, FALSE, 200);
             if (wait == WAIT_OBJECT_0) return;
-            if (wait == WAIT_OBJECT_0 + 1 && !exitedAt) exitedAt = now();
-            if (wait == WAIT_FAILED || now() >= read(deadline) || (exitedAt && now() - exitedAt >= 5000)) {
+            if (wait == WAIT_OBJECT_0 + 1 && !targetExited) { exitedAt = awakeNow(); targetExited = true; }
+            LONG64 awakeTick = awakeNow();
+            if (wait == WAIT_FAILED || deadline.expired(awakeTick) || (targetExited && awakeTick - exitedAt >= 5000)) {
                 // Bypass DLL shutdown callbacks that might themselves be blocked.
                 // Incomplete evidence remains on disk; no target process is altered.
                 auto code = exitedAt ? 125u : 124u;

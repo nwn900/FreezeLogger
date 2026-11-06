@@ -35,7 +35,12 @@ int main(int argc, char** argv) {
         std::string(100000, 'A'),
         std::string("Unhandled exception \"X\" at 0x") + std::string(64, 'F') + " M.dll+0x1\n",
         "PROBABLE CALL STACK:\n[0] 0x1 (A.dll+0x1)\n[1] 0x2 (B.DLL+0X2)\n[bad line\n[2] 0x3\n",
-        std::string("x\0y\nUnhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x10 Z.dll+0x1\n", 74),
+        std::string([] {
+            static constexpr char embedded[] = "x\0y\nUnhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x10 Z.dll+0x1\n";
+            return embedded;
+        }(), sizeof("x\0y\nUnhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x10 Z.dll+0x1\n") - 1),
+        std::string("Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0xFFFFFFFFFFFFFFFFF Overflow.dll+0x1\n"),
+        std::string("Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x10 My Plugin.dll+0x2\n"),
         "Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x10 C:\\P\\Q.dll+0x1\r\n"
         "PROBABLE CALL STACK:\r\n[0] 0x10 (Q.dll+0x1)\r\n",
     };
@@ -47,7 +52,7 @@ int main(int argc, char** argv) {
             auto size = file.file_size(sizeError);
             if (sizeError || size > 4 * 1024 * 1024) continue;
             FILE* handle = nullptr;
-            if (fopen_s(&handle, file.path().string().c_str(), "rb") != 0 || !handle) continue;
+            if (_wfopen_s(&handle, file.path().c_str(), L"rb") != 0 || !handle) continue;
             std::string text(static_cast<std::size_t>(size), '\0');
             std::size_t read = fread(text.data(), 1, text.size(), handle);
             fclose(handle);

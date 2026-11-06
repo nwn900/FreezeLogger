@@ -1,6 +1,7 @@
 #include "../src/shared.hpp"
 #include "../src/frames.hpp"
 #include "../src/history.hpp"
+#include "../src/runtime.hpp"
 #include <d3d11.h>
 #include <dxgi.h>
 #include <dbghelp.h>
@@ -20,6 +21,39 @@ int wmain(int argc, wchar_t** argv) {
     auto folder = std::filesystem::current_path() / ("feature-evidence-" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(folder);
     auto shared = std::make_unique<fs::Shared>(); shared->pid = GetCurrentProcessId();
+    {
+        fs::FrameSignal native, etw;
+        check(etw.publish(900, 905, 2), "ETW frame publication");
+        auto etwSample = etw.snapshot();
+        check(etwSample.present && etwSample.count == 1 && etwSample.tick == 900, "coherent ETW frame snapshot");
+        auto selection = fs::selectFrameProvider(native.snapshot(), etwSample, true);
+        check(selection.source == 1 && selection.sample.tick == 900, "ETW fallback selected when native adapter is absent");
+        check(native.publish(1000, 1001, 3), "native frame publication");
+        selection = fs::selectFrameProvider(native.snapshot(), etw.snapshot(), true);
+        check(selection.source == 2 && selection.sample.tick == 1000, "native frame source outranks delayed ETW");
+        LONG64 eventTick = 0;
+        check(fs::frameTickFromQpc(100000, 200000, 1000000, 10000, eventTick) && eventTick == 9900,
+              "ETW presentation timestamp maps from QPC to monotonic milliseconds");
+        check(!fs::frameTickFromQpc(200000, 100000, 1000000, 10000, eventTick),
+              "future or invalid raw QPC timestamps are rejected");
+    }
+    {
+        std::string diagnostic = fs::utf8(L"\u017c\u00f3\u0142\u0107\t\"\\\x01");
+        std::string escaped = fs::jsonEscape(diagnostic);
+        check(escaped.find("\xC5\xBC\xC3\xB3\xC5\x82\xC4\x87") != std::string::npos && escaped.find("\\t") != std::string::npos &&
+              escaped.find("\\\"") != std::string::npos && escaped.find("\\\\") != std::string::npos &&
+              escaped.find("\\u0001") != std::string::npos,
+              "UTF-8 diagnostic paths and JSON control escaping remain valid");
+        std::wstring invalidUtf16(1, static_cast<wchar_t>(0xd800));
+        check(fs::diagnosticUtf8(invalidUtf16) == "<text-encoding-error>",
+              "invalid UTF-16 diagnostic text cannot abort report capture");
+    }
+    check(fs::RuntimeModuleClassifier::isVictimLocation("f4se_1_10_163.dll") &&
+          fs::RuntimeModuleClassifier::isF4seRuntime("f4sevr_1_2_72.dll"),
+          "versioned F4SE runtime modules are recognized");
+    check(!fs::RuntimeModuleClassifier::isF4seRuntime("f4se_1__163.dll") &&
+          !fs::RuntimeModuleClassifier::isF4seRuntime("f4se_custom.dll"),
+          "malformed F4SE runtime names are not classified as versioned runtimes");
     if (argc == 2 && std::wstring(argv[1]) == L"--frames") {
         fs::FrameObserver observer(shared.get());
         auto error = observer.start();
@@ -43,16 +77,20 @@ int wmain(int argc, wchar_t** argv) {
         auto deadline = fs::now() + 4000;
         while (fs::now() < deadline) { if (chain->Present(0, 0) == S_OK) ++succeeded; Sleep(20); }
         Sleep(1500);
-        receipt << "S_OK_presents=" << succeeded << " observed=" << fs::read(shared->frameCount) << '\n'; receipt.flush();
-        check(succeeded && fs::read(shared->frameCount) > 0 && fs::read(shared->frameSource) == 1, "real DXGI ETW Present signals");
+        auto observed = observer.current();
+        receipt << "S_OK_presents=" << succeeded << " observed=" << observed.sample.count << '\n'; receipt.flush();
+        check(succeeded && observed.sample.count > 0 && observed.source == 1, "real DXGI ETW Present signals");
         auto before = fs::read(shared->frameCount);
         for (unsigned i = 0; i < 25; ++i) chain->Present(0, DXGI_PRESENT_TEST);
         Sleep(1500);
+        observer.current();
         check(fs::read(shared->frameCount) == before, "DXGI test-only presents excluded");
-        shared->frameSource = 2;
+        check(shared->nativeFrames.publish(fs::now(), fs::now(), GetCurrentThreadId()), "native adapter frame fixture");
         for (unsigned i = 0; i < 25; ++i) chain->Present(0, 0);
         Sleep(1500);
-        check(fs::read(shared->frameCount) == before, "native frame adapter not overwritten by ETW");
+        auto selected = observer.current();
+        check(selected.source == 2 && selected.sample.count == 1 && fs::read(shared->frameCount) == 1,
+              "native frame adapter not overwritten by ETW");
         context->Release(); device->Release(); chain->Release(); DestroyWindow(window);
         std::cout << "PASS: real DXGI Present ETW, test exclusion, adapter precedence. Evidence: " << folder.string() << '\n';
         return 0;
@@ -113,6 +151,34 @@ int wmain(int argc, wchar_t** argv) {
         check(std::filesystem::exists(otherHistory) && std::filesystem::exists(otherIncident) && std::filesystem::exists(otherDump),
               "another live collector history and capture protected");
     }
+
+    // A newer freeze for an active PID supersedes its older manual report as
+    // the protected live incident, allowing the older manual record to satisfy
+    // a total-storage quota.
+    auto activeAudit = folder / "live-retention-audit";
+    std::filesystem::create_directories(activeAudit);
+    auto activeSession = activeAudit / "session-987.log";
+    auto oldManual = activeAudit / "manual-20261008-010000-000-987.log";
+    auto newFreeze = activeAudit / "freeze-20261008-020000-000-987.log";
+    write(activeSession, 16); write(oldManual, 2 * 1024 * 1024); write(newFreeze, 16);
+    std::filesystem::last_write_time(oldManual, std::filesystem::file_time_type::clock::now() - std::chrono::hours(2));
+    std::filesystem::last_write_time(newFreeze, std::filesystem::file_time_type::clock::now() - std::chrono::hours(1));
+    auto activePartial = activeAudit / "prehang-987.log.partial";
+    write(activePartial, 128);
+    {
+        fs::Handle lease(CreateFileW(activeSession.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+        check(lease.value != INVALID_HANDLE_VALUE, "live retention collector lease");
+        fs::retain(activeAudit, 10, 10, 1, activeSession);
+        check(!std::filesystem::exists(oldManual) && std::filesystem::exists(newFreeze),
+              "quota prunes older active manual report but preserves newer freeze");
+        check(std::filesystem::exists(activePartial), "active prehang partial remains protected");
+    }
+    auto abandoned = activeAudit / "prehang-988.log.partial";
+    write(abandoned, 64);
+    std::filesystem::last_write_time(abandoned, std::filesystem::file_time_type::clock::now() - std::chrono::hours(2));
+    fs::retain(activeAudit, 10, 10);
+    check(!std::filesystem::exists(abandoned), "abandoned prehang partial participates in stale cleanup");
     fs::retain(folder, 1, 1, 1, active);
     check(!std::filesystem::exists(otherDump), "completed collector dump becomes eligible for quota");
     auto link = folder / "freeze-20261008-040000-000-1.dmp";

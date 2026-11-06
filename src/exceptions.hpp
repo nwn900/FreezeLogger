@@ -47,22 +47,22 @@ public:
     void write(std::ostream& log) const {
         if (!state_) return;
         log << "\nRECENT_NATIVE_EXCEPTIONS (first chance; may have been handled; not proof of a crash cause)\n";
-        LONG count = read(state_->faultCount);
-        LONG begin = std::max<LONG>(0, count - faultCapacity);
+        LONG64 count = read(state_->faultCount);
+        LONG64 begin = std::max<LONG64>(0, count - faultCapacity);
         log << "observed_count=" << count
             << " retained_window_count=" << count - begin
             << " ring_capacity=" << faultCapacity
             << " dropped_concurrent=" << read(state_->faultsDropped) << '\n';
         const char* names[]{"RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15"};
-        LONG emitted = 0, skipped = 0;
-        for (LONG n = begin; n < count; ++n) {
+        LONG64 emitted = 0, skipped = 0;
+        for (LONG64 n = begin; n < count; ++n) {
             auto& slot = state_->faults[static_cast<ULONG>(n) % static_cast<ULONG>(faultCapacity)];
             LONG sequence = read(slot.sequence);
             if (sequence & 1) { ++skipped; continue; }
             FaultData fault = slot.data;
             MemoryBarrier();
-            if (sequence != read(slot.sequence)) { ++skipped; continue; }
-            log << "tick=" << fault.tick << " thread=" << fault.thread << " code=0x" << std::hex << fault.code
+            if (sequence != read(slot.sequence) || fault.ordinal != n + 1) { ++skipped; continue; }
+            log << "ordinal=" << fault.ordinal << " tick=" << fault.tick << " thread=" << fault.thread << " code=0x" << std::hex << fault.code
                 << " IP=0x" << fault.ip << " flags=0x" << fault.flags << std::dec << " parameters=" << fault.parameterCount;
             for (unsigned i = 0; i < std::min<unsigned>(4, fault.parameterCount); ++i)
                 log << " p" << i << "=0x" << std::hex << fault.parameters[i] << std::dec;
@@ -81,16 +81,16 @@ public:
         KeptFault kept;
         if (!state_) return kept;
         std::vector<FaultData> faults;
-        LONG count = read(state_->faultCount);
-        LONG begin = std::max<LONG>(0, count - faultCapacity);
+        LONG64 count = read(state_->faultCount);
+        LONG64 begin = std::max<LONG64>(0, count - faultCapacity);
         faults.reserve(static_cast<size_t>(count - begin));
-        for (LONG n = begin; n < count; ++n) {
+        for (LONG64 n = begin; n < count; ++n) {
             auto& slot = state_->faults[static_cast<ULONG>(n) % static_cast<ULONG>(faultCapacity)];
             LONG sequence = read(slot.sequence);
             if (sequence & 1) continue;
             FaultData fault = slot.data;
             MemoryBarrier();
-            if (sequence != read(slot.sequence)) continue;
+            if (sequence != read(slot.sequence) || fault.ordinal != n + 1) continue;
             faults.push_back(fault);
         }
         auto consider = [&](const FaultData& fault, const char* rule) {
@@ -139,10 +139,12 @@ private:
             InterlockedIncrement(&state_->faultsDropped);
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        ULONG index = static_cast<ULONG>(read(state_->faultCount)) % static_cast<ULONG>(faultCapacity);
+        LONG64 ordinal = read(state_->faultCount) + 1;
+        ULONG index = static_cast<ULONG>(ordinal - 1) % static_cast<ULONG>(faultCapacity);
         auto& slot = state_->faults[index];
         InterlockedIncrement(&slot.sequence);
         const auto& context = *exception->ContextRecord;
+        slot.data.ordinal = ordinal;
         slot.data.tick = now();
         slot.data.code = code;
         slot.data.thread = GetCurrentThreadId();
@@ -159,7 +161,7 @@ private:
                           sizeof(slot.data.stackWords), &bytes);
         slot.data.stackBytes = static_cast<DWORD>(bytes);
         InterlockedIncrement(&slot.sequence);
-        InterlockedIncrement(&state_->faultCount);
+        InterlockedExchange64(&state_->faultCount, ordinal);
         InterlockedExchange(&state_->faultWriting, 0);
         return EXCEPTION_CONTINUE_SEARCH;
     }
