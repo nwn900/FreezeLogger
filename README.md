@@ -5,14 +5,12 @@ collector. The DLL uses public F4SE interfaces; no Address Library, CommonLib
 or game memory patches. A separately gated collector adapter reads engine
 context only from a qualified 1.10.163 executable.
 
-Version 0.3.2 repairs crash-exit correlation and audits detection, evidence,
-retention and release packaging. It bounds foreground suppression, uses an
-awake-time collector deadline, keeps frame sources and samples coherent,
-correlates only recent crash logs from the same game edition/version/session,
-and records that correlation in exit evidence. UTF-8 paths, fault-ring ordinals,
-runtime classification, retention and source packaging have regression tests.
-The direct Fallout 4 1.10.163/F4SE 0.6.23 startup smoke test passed; no save was
-loaded and no real crash or gameplay freeze was reproduced. See
+Version 0.3.3 fixes frame resume and provider-handover edge cases, preserves
+native frame authority during concurrent reads, requires process exception and
+loaded-module evidence before crash-log corroboration, parses complete module
+fields, and verifies the canonical ZIP layout. Edition, version, and time only
+identify a candidate; incident corroboration also needs the exact in-process
+exception and matching loaded image. See
 [validation](docs/VALIDATION.md) for evidence and limits.
 
 ## Install
@@ -95,8 +93,10 @@ an unresponsive background window still reports. Each session writes a
 machine-readable `preflight-<PID>.json` beside the session log. When a dump
 cannot be written, a `WER_LocalDumps_Hint.txt` explains the Windows fallback.
 Incident logs add `SELECTED_EXCEPTION` (first-candidate native fault rule) and
-`CANDIDATE_CONSENSUS` (agreement with the newest Buffout 4 crash log, callback
-thread stacks and stable thread groups); both are heuristics, not verdicts.
+`CANDIDATE_CONSENSUS` (comparison of process-corroborated crash evidence with
+callback-thread stacks and stable thread groups). A metadata/time-only Buffout
+candidate is labeled separately and is not attributed to the current process;
+even corroborated agreement is evidence, not a cause verdict.
 
 Dumps first write to `.dmp.partial`. Only a flushed file with valid x64 header,
 required streams, thread contexts, stack and memory bounds is renamed `.dmp`.
@@ -198,12 +198,12 @@ From an x64 MSVC developer shell with CMake/Ninja:
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build
 ctest --test-dir build --output-on-failure `
-  --output-junit "$((Get-Location).Path)\build\validation-0.3.2.xml"
+  --output-junit "$((Get-Location).Path)\build\validation-0.3.3.xml"
 python scripts/package.py --build build --config RelWithDebInfo `
-  --stage build/package-0.3.2-release --artifacts artifacts/release-0.3.2 `
-  --test-report build/validation-0.3.2.xml
+  --stage build/package-0.3.3-release --artifacts artifacts/release-0.3.3 `
+  --test-report build/validation-0.3.3.xml
 python scripts/verify_release.py --build build --config RelWithDebInfo `
-  --package build/package-0.3.2-release
+  --package build/package-0.3.3-release
 ```
 
 The ABI verifier uses Python/7-Zip and downloads public SDK evidence into

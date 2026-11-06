@@ -280,7 +280,8 @@ std::string moduleBaseName(DWORD64 address, const std::vector<Module>& modules) 
 struct ExternalCrash {
     BuffoutCrashInfo info;
     std::string path;
-    bool matched = false;
+    bool candidate = false;
+    bool corroborated = false;
     std::uint64_t ageMs = 0;
     std::string correlation;
 };
@@ -297,11 +298,12 @@ std::string oneLine(std::string value) {
     for (char& c : value) if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) c = '?';
     return value;
 }
-// Selects only a crash log matching this game's edition, binary version,
-// process start time, and recent incident window. Other logs remain context.
-ExternalCrash findExternalCrashLog(const std::filesystem::path& gameImage, Shared* state) {
-    ExternalCrash newestMatch, newestContext;
-    std::uint64_t newestMatchTime = 0, newestContextTime = 0;
+// Selects a recent metadata-compatible candidate, then requires a matching
+// exception and loaded image from this process before incident corroboration.
+ExternalCrash findExternalCrashLog(const std::filesystem::path& gameImage, Shared* state,
+                                  const std::vector<CrashModuleIdentity>& modules) {
+    ExternalCrash newestCorroborated, newestCandidate, newestContext;
+    std::uint64_t newestCorroboratedTime = 0, newestCandidateTime = 0, newestContextTime = 0;
     auto gameName = buffout::lower(diagnosticPath(gameImage.filename()));
     auto edition = gameName == "fallout4vr.exe" ? BuffoutCrashInfo::Edition::Fallout4VR :
                    gameName == "fallout4.exe" ? BuffoutCrashInfo::Edition::Fallout4 :
@@ -318,6 +320,11 @@ ExternalCrash findExternalCrashLog(const std::filesystem::path& gameImage, Share
     session.processStartedFileTime = state ? static_cast<std::uint64_t>(read(state->processCreated)) : 0;
     session.observedFileTime = fileTimeValue(observed);
     CrashLogCorrelator correlator(std::move(session));
+    ExceptionJournal journal(state);
+    std::vector<ProcessExceptionIdentity> exceptions;
+    for (const auto& fault : journal.recent())
+        exceptions.push_back({fault.code, fault.ip, fault.fileTime});
+    CrashIncidentCorrelator incidentCorrelator;
     const wchar_t* gameFolder = edition == BuffoutCrashInfo::Edition::Fallout4VR ? L"Fallout4VR" : L"Fallout4";
     std::error_code error;
     auto iterator = std::filesystem::directory_iterator(root / "My Games" / gameFolder / "F4SE", error);
@@ -343,16 +350,23 @@ ExternalCrash findExternalCrashLog(const std::filesystem::path& gameImage, Share
         BuffoutCrashInfo info = parseBuffoutCrashLog(text, diagnosticPath(path));
         if (!info.found) continue;
         CrashLogMatch match = correlator.assess(info, written);
-        ExternalCrash candidate{std::move(info), diagnosticPath(path), match.matched, match.ageMs, match.reason};
-        if (match.matched && written >= newestMatchTime) {
-            newestMatchTime = written;
-            newestMatch = std::move(candidate);
-        } else if (!match.matched && written >= newestContextTime) {
+        auto incident = match.candidate ? incidentCorrelator.assess(info, written, exceptions, modules) : CrashIncidentMatch{};
+        ExternalCrash candidate{std::move(info), diagnosticPath(path), match.candidate,
+                                incident.corroborated, match.ageMs,
+                                incident.corroborated ? incident.reason : match.reason};
+        if (candidate.corroborated && written >= newestCorroboratedTime) {
+            newestCorroboratedTime = written;
+            newestCorroborated = std::move(candidate);
+        } else if (candidate.candidate && written >= newestCandidateTime) {
+            newestCandidateTime = written;
+            newestCandidate = std::move(candidate);
+        } else if (!candidate.candidate && written >= newestContextTime) {
             newestContextTime = written;
             newestContext = std::move(candidate);
         }
     }
-    return newestMatch.matched ? newestMatch : newestContext;
+    if (newestCorroborated.corroborated) return newestCorroborated;
+    return newestCandidate.candidate ? newestCandidate : newestContext;
 }
 std::string externalCrashReport(const ExternalCrash& external) {
     std::ostringstream out;
@@ -360,11 +374,19 @@ std::string externalCrashReport(const ExternalCrash& external) {
         out << "EXTERNAL_CRASH_CORRELATION status=none; no parseable crash log found for this game edition\n";
         return out.str();
     }
-    out << "EXTERNAL_CRASH_CORRELATION status=" << (external.matched ? "matched" : "context-only")
+    const char* status = external.corroborated ? "process-exception-corroborated" :
+                         external.candidate ? "recent-candidate" : "context-only";
+    out << "EXTERNAL_CRASH_CORRELATION status=" << status
         << " correlation=" << external.correlation << " age_ms=" << external.ageMs
         << " file=" << oneLine(external.path) << '\n';
-    if (!external.matched) {
-        out << "external crash log was not used for current-incident attribution\n";
+    if (!external.corroborated) {
+        if (external.candidate) {
+            out << "candidate_game_version=" << external.info.gameVersion << " exception=" << external.info.exceptionName
+                << " code=0x" << std::hex << external.info.exceptionCode << std::dec << " fault="
+                << (external.info.faultModule.empty() ? "unknown-module" : external.info.faultModule)
+                << (external.info.faultOffset.empty() ? "" : "+" + external.info.faultOffset) << '\n';
+            out << "Metadata and time are not process identity; this candidate was not used for attribution.\n";
+        } else out << "external crash log was not used for current-incident attribution\n";
         return out.str();
     }
     out << "external_game_version=" << external.info.gameVersion
@@ -373,11 +395,12 @@ std::string externalCrashReport(const ExternalCrash& external) {
         << (external.info.faultModule.empty() ? "unknown-module" : external.info.faultModule)
         << (external.info.faultOffset.empty() ? "" : "+" + external.info.faultOffset) << '\n';
     if (!external.info.stackModules.empty()) out << "external_top_frame=" << external.info.stackModules.front() << '\n';
-    out << "Correlation links the Buffout record to this game session; it does not establish a crash cause.\n";
+    out << "The fault matches this process's exception and loaded module; this corroborates the incident, not its cause.\n";
     return out.str();
 }
-std::string externalCrashEvidence(const std::filesystem::path& gameImage, Shared* state) {
-    return externalCrashReport(findExternalCrashLog(gameImage, state));
+std::string externalCrashEvidence(const std::filesystem::path& gameImage, Shared* state,
+                                  const std::vector<CrashModuleIdentity>& modules) {
+    return externalCrashReport(findExternalCrashLog(gameImage, state, modules));
 }
 std::string profile(HANDLE target, bool stacks, Shared* state, bool reset) {
     struct CPU { LONG64 created, cpu; };
@@ -754,7 +777,12 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     log << waitChains(threadIDs);
     log.flush();
     log << "\nCANDIDATE_CONSENSUS (agreement heuristic, not a verdict; confirm by isolation or reproduction)\n";
-    ExternalCrash external = findExternalCrashLog(gameImage, state);
+    std::vector<CrashModuleIdentity> crashModules;
+    crashModules.reserve(lastModules.size());
+    for (const auto& module : lastModules)
+        crashModules.push_back({module.base, module.size,
+                                buffout::lower(diagnosticPath(module.path.filename()))});
+    ExternalCrash external = findExternalCrashLog(gameImage, state, crashModules);
     log << externalCrashReport(external);
     struct OwnCandidate { std::string module; DWORD thread = 0; unsigned repeats = 0; bool present = false; };
     OwnCandidate own;
@@ -768,20 +796,23 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
                 own = {module, id, found->second.ripSequence.repeats(), true};
         }
     log << "own_candidate=" << (own.present ? own.module + " (callback thread RIP agreement)" : "none") << '\n';
-    if (external.matched && external.info.found && own.present) {
+    if (external.corroborated && external.info.found && own.present) {
         if (external.info.faultModule == own.module) {
             if (RuntimeModuleClassifier::isVictimLocation(own.module))
                 log << "consensus=victim-location-caution " << own.module
                     << " (system/game/logger image is usually where corruption lands, not the cause)\n";
             else
-                log << "consensus=agree-strong " << own.module
-                    << " (external log and live callback stacks agree; still confirm by isolation)\n";
+                log << "consensus=process-exception-and-callback-agree " << own.module
+                    << " (evidence agrees, but agreement does not prove cause)\n";
         } else {
             log << "consensus=disagree external=" << external.info.faultModule << " live=" << own.module
                 << " (treat both as leads)\n";
         }
-    } else if (external.matched && external.info.found) {
-        log << "consensus=external-only " << external.info.faultModule << '\n';
+    } else if (external.corroborated && external.info.found) {
+        log << "consensus=process-exception-and-module-match " << external.info.faultModule
+            << " (process evidence corroborates the fault record, not its cause)\n";
+    } else if (external.candidate) {
+        log << "consensus=recent-external-candidate-only (not used for current-process attribution)\n";
     } else {
         log << "consensus=no-correlated-external-log\n";
     }

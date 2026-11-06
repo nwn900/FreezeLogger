@@ -44,6 +44,24 @@ public:
         return true;
     }
 
+    std::vector<FaultData> recent() const {
+        std::vector<FaultData> faults;
+        if (!state_) return faults;
+        LONG64 count = read(state_->faultCount);
+        LONG64 begin = std::max<LONG64>(0, count - faultCapacity);
+        faults.reserve(static_cast<size_t>(count - begin));
+        for (LONG64 n = begin; n < count; ++n) {
+            auto& slot = state_->faults[static_cast<ULONG>(n) % static_cast<ULONG>(faultCapacity)];
+            LONG sequence = read(slot.sequence);
+            if (sequence & 1) continue;
+            FaultData fault = slot.data;
+            MemoryBarrier();
+            if (sequence != read(slot.sequence) || fault.ordinal != n + 1) continue;
+            faults.push_back(fault);
+        }
+        return faults;
+    }
+
     void write(std::ostream& log) const {
         if (!state_) return;
         log << "\nRECENT_NATIVE_EXCEPTIONS (first chance; may have been handled; not proof of a crash cause)\n";
@@ -62,7 +80,8 @@ public:
             FaultData fault = slot.data;
             MemoryBarrier();
             if (sequence != read(slot.sequence) || fault.ordinal != n + 1) { ++skipped; continue; }
-            log << "ordinal=" << fault.ordinal << " tick=" << fault.tick << " thread=" << fault.thread << " code=0x" << std::hex << fault.code
+            log << "ordinal=" << fault.ordinal << " tick=" << fault.tick << " filetime=" << fault.fileTime
+                << " thread=" << fault.thread << " code=0x" << std::hex << fault.code
                 << " IP=0x" << fault.ip << " flags=0x" << fault.flags << std::dec << " parameters=" << fault.parameterCount;
             for (unsigned i = 0; i < std::min<unsigned>(4, fault.parameterCount); ++i)
                 log << " p" << i << "=0x" << std::hex << fault.parameters[i] << std::dec;
@@ -80,19 +99,7 @@ public:
     KeptFault selected() const {
         KeptFault kept;
         if (!state_) return kept;
-        std::vector<FaultData> faults;
-        LONG64 count = read(state_->faultCount);
-        LONG64 begin = std::max<LONG64>(0, count - faultCapacity);
-        faults.reserve(static_cast<size_t>(count - begin));
-        for (LONG64 n = begin; n < count; ++n) {
-            auto& slot = state_->faults[static_cast<ULONG>(n) % static_cast<ULONG>(faultCapacity)];
-            LONG sequence = read(slot.sequence);
-            if (sequence & 1) continue;
-            FaultData fault = slot.data;
-            MemoryBarrier();
-            if (sequence != read(slot.sequence) || fault.ordinal != n + 1) continue;
-            faults.push_back(fault);
-        }
+        auto faults = recent();
         auto consider = [&](const FaultData& fault, const char* rule) {
             if (!kept.present || fault.tick < kept.tick) {
                 kept.present = true;
@@ -146,6 +153,9 @@ private:
         const auto& context = *exception->ContextRecord;
         slot.data.ordinal = ordinal;
         slot.data.tick = now();
+        FILETIME observed{};
+        GetSystemTimeAsFileTime(&observed);
+        slot.data.fileTime = static_cast<std::uint64_t>(filetime(observed));
         slot.data.code = code;
         slot.data.thread = GetCurrentThreadId();
         slot.data.flags = record.ExceptionFlags;

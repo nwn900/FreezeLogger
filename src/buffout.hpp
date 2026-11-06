@@ -13,6 +13,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "crash_identity.hpp"
 
 namespace fs {
 struct BuffoutCrashInfo {
@@ -65,12 +66,21 @@ inline bool parseHex(const std::string& text, std::size_t& at, std::uint64_t& va
     value = result;
     return true;
 }
-// Reads the image following an address. Spaces are valid filename characters;
-// path separators, rather than whitespace, identify the basename boundary.
-inline std::string imageAfter(const std::string& line, std::size_t from) {
+struct ModuleField {
+    std::string basename;
+    std::string offset;
+};
+inline ModuleField moduleFieldAfter(const std::string& line, std::size_t from) {
     static const char* extensions[] = {".dll", ".exe", ".asi"};
     while (from < line.size() && (line[from] == ' ' || line[from] == '\t' || line[from] == '(' ||
                                    line[from] == '[' || line[from] == '"' || line[from] == '\'')) ++from;
+    std::size_t limit = line.size();
+    while (limit > from && (line[limit - 1] == ' ' || line[limit - 1] == '\t' || line[limit - 1] == ')' ||
+                            line[limit - 1] == ']' || line[limit - 1] == '"' || line[limit - 1] == '\'')) --limit;
+    ModuleField result;
+    std::size_t moduleEnd = 0;
+    std::size_t offsetStart = 0;
+    std::size_t offsetEnd = 0;
     for (std::size_t i = from; i < line.size(); ++i) {
         for (const char* extension : extensions) {
             std::size_t length = 4;
@@ -79,17 +89,49 @@ inline std::string imageAfter(const std::string& line, std::size_t from) {
             for (std::size_t k = 0; k < length; ++k)
                 if (std::tolower(static_cast<unsigned char>(line[i + k])) != extension[k]) { match = false; break; }
             if (!match) continue;
+            std::size_t end = i + length;
+            std::size_t suffix = end;
+            while (suffix < limit && (line[suffix] == ' ' || line[suffix] == '\t')) ++suffix;
+            std::size_t candidateOffsetStart = 0, candidateOffsetEnd = 0;
+            if (suffix < limit && line[suffix] == '+') {
+                candidateOffsetStart = suffix + 1;
+                if (line.compare(candidateOffsetStart, 2, "0x") == 0 || line.compare(candidateOffsetStart, 2, "0X") == 0)
+                    candidateOffsetStart += 2;
+                std::size_t cursor = candidateOffsetStart;
+                std::uint64_t ignored = 0;
+                if (!parseHex(line, cursor, ignored)) continue;
+                if (cursor < limit && line[cursor] != ' ' && line[cursor] != '\t' && line[cursor] != ')' &&
+                    line[cursor] != ']' && line[cursor] != '"' && line[cursor] != '\'') continue;
+                candidateOffsetEnd = cursor;
+            } else if (suffix != limit) {
+                continue;
+            }
             std::size_t begin = from;
             for (std::size_t cursor = from; cursor < i; ++cursor)
                 if (line[cursor] == '\\' || line[cursor] == '/') begin = cursor + 1;
-            std::size_t end = i + length;
-            while (end > begin && (line[end - 1] == ' ' || line[end - 1] == '\t' || line[end - 1] == ')' ||
-                                   line[end - 1] == ']' || line[end - 1] == '"' || line[end - 1] == '\'')) --end;
+            while (begin < i && (line[begin] == ' ' || line[begin] == '\t' || line[begin] == '"' ||
+                                 line[begin] == '\'' || line[begin] == '(' || line[begin] == '[')) ++begin;
             if (begin >= end) continue;
-            return lower(line.substr(begin, end - begin));
+            moduleEnd = end;
+            offsetStart = candidateOffsetStart;
+            offsetEnd = candidateOffsetEnd;
+            result.basename = lower(line.substr(begin, moduleEnd - begin));
         }
     }
-    return {};
+    if (result.basename.empty()) return {};
+    if (offsetEnd > offsetStart) {
+        std::size_t cursor = offsetStart;
+        std::uint64_t value = 0;
+        if (parseHex(line, cursor, value) && cursor == offsetEnd) {
+            std::ostringstream formatted;
+            formatted << "0x" << std::hex << value;
+            result.offset = formatted.str();
+        }
+    }
+    return result;
+}
+inline std::string imageAfter(const std::string& line, std::size_t from) {
+    return moduleFieldAfter(line, from).basename;
 }
 inline std::string normalizeVersion(std::string value) {
     value = trim(value);
@@ -148,18 +190,9 @@ inline BuffoutCrashInfo parseBuffoutCrashLog(const std::string& text, const std:
                 if (address != std::string::npos) {
                     std::size_t digits = address + 2;
                     if (buffout::parseHex(line, digits, info.faultAddress)) {
-                        info.faultModule = buffout::imageAfter(line, digits);
-                        std::size_t plus = line.find('+', digits);
-                        if (plus != std::string::npos) {
-                            std::size_t offset = plus + 1;
-                            if (line.compare(offset, 2, "0x") == 0 || line.compare(offset, 2, "0X") == 0) offset += 2;
-                            std::uint64_t value = 0;
-                            if (buffout::parseHex(line, offset, value)) {
-                                std::ostringstream out;
-                                out << "0x" << std::hex << value;
-                                info.faultOffset = out.str();
-                            }
-                        }
+                        auto module = buffout::moduleFieldAfter(line, digits);
+                        info.faultModule = std::move(module.basename);
+                        info.faultOffset = std::move(module.offset);
                     }
                 } else if (close != std::string::npos) {
                     info.faultModule = buffout::imageAfter(line, close + 1);
@@ -197,13 +230,13 @@ struct CrashLogSession {
     std::uint64_t maximumAgeMs = 5 * 60 * 1000;
 };
 struct CrashLogMatch {
-    bool matched = false;
+    bool candidate = false;
     std::uint64_t ageMs = 0;
     std::string reason;
 };
 
-// Correlates a parsed crash log to one game process. This deliberately fails
-// closed so old logs and a different runtime remain context, never consensus.
+// Filters crash-log candidates by metadata and age. It cannot establish which
+// process wrote the file, so a candidate alone never counts as a process match.
 class CrashLogCorrelator final {
 public:
     explicit CrashLogCorrelator(CrashLogSession session) : session_(std::move(session)) {}
@@ -225,9 +258,46 @@ public:
         std::uint64_t age = session_.observedFileTime > writtenFileTime
             ? (session_.observedFileTime - writtenFileTime) / 10000ULL : 0;
         if (age > session_.maximumAgeMs) return {false, age, "outside-session-correlation-window"};
-        return {true, age, "same-edition-version-session-and-time"};
+        return {true, age, "same-edition-version-and-time-candidate"};
     }
 private:
     CrashLogSession session_;
+};
+
+struct CrashIncidentMatch {
+    bool corroborated = false;
+    std::uint64_t deltaMs = 0;
+    std::string reason;
+};
+
+// Requires an exact first-chance exception and a loaded image identity from
+// this process before a time-compatible log can support incident attribution.
+class CrashIncidentCorrelator final {
+public:
+    CrashIncidentMatch assess(const BuffoutCrashInfo& crash, std::uint64_t logFileTime,
+                              const std::vector<ProcessExceptionIdentity>& exceptions,
+                              const std::vector<CrashModuleIdentity>& modules) const {
+        if (!crash.found || !crash.exceptionCode || !crash.faultAddress || crash.faultModule.empty() ||
+            crash.faultOffset.empty()) return {false, 0, "crash-identity-incomplete"};
+        std::size_t cursor = crash.faultOffset.starts_with("0x") || crash.faultOffset.starts_with("0X") ? 2 : 0;
+        std::uint64_t expectedOffset = 0;
+        if (!buffout::parseHex(crash.faultOffset, cursor, expectedOffset) || cursor != crash.faultOffset.size())
+            return {false, 0, "crash-offset-invalid"};
+        constexpr std::uint64_t maximumDelta100ns = 5ULL * 60ULL * 1000ULL * 10000ULL;
+        for (const auto& exception : exceptions) {
+            if (exception.code != crash.exceptionCode || exception.address != crash.faultAddress || !exception.fileTime)
+                continue;
+            const auto delta = logFileTime >= exception.fileTime
+                ? logFileTime - exception.fileTime : exception.fileTime - logFileTime;
+            if (delta > maximumDelta100ns) continue;
+            for (const auto& module : modules) {
+                if (exception.address < module.base || exception.address - module.base >= module.size ||
+                    buffout::lower(module.basename) != crash.faultModule ||
+                    exception.address - module.base != expectedOffset) continue;
+                return {true, delta / 10000ULL, "exact-current-process-exception-and-loaded-module"};
+            }
+        }
+        return {false, 0, "no-matching-current-process-exception-and-loaded-module"};
+    }
 };
 } // namespace fs

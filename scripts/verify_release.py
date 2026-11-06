@@ -49,9 +49,9 @@ def package_reader(package: Path):
     names = archive.namelist()
 
     def member(name: str) -> str:
-        matches = [entry for entry in names if entry == name or entry.endswith("/" + name)]
+        matches = [entry for entry in names if entry == name]
         if len(matches) != 1:
-            raise FileNotFoundError(f"expected one packaged entry {name}, found {len(matches)}")
+            raise FileNotFoundError(f"expected one canonical packaged entry {name}, found {len(matches)}")
         return matches[0]
 
     def read(name: str) -> bytes:

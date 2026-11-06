@@ -111,10 +111,10 @@ ULONG FrameObserver::start() {
     });
     return ERROR_SUCCESS;
 }
-FrameSelection FrameObserver::current() const noexcept {
+FrameSelection FrameObserver::current() noexcept {
     const auto etw = state->etwFrames.snapshot();
     const auto native = state->nativeFrames.snapshot();
-    auto selected = selectFrameProvider(native, etw, read(state->frameStatus) == ERROR_SUCCESS);
+    auto selected = selector.select(native, etw, read(state->frameStatus) == ERROR_SUCCESS);
     InterlockedExchange(&state->frameSource, selected.source);
     InterlockedExchange(&state->frameThread, static_cast<LONG>(selected.sample.thread));
     InterlockedExchange64(&state->frameTick, selected.sample.tick);

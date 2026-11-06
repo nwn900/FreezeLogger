@@ -4,9 +4,11 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <limits>
 #include <stdexcept>
 #include <system_error>
+#include "crash_identity.hpp"
 #include "telemetry.hpp"
 
 namespace fs {
@@ -56,9 +58,10 @@ inline std::string jsonEscape(std::string_view value) {
 }
 inline constexpr LONG magic = 0x46534634;
 inline constexpr LONG faultCapacity = 512;
-inline constexpr char toolVersion[] = "0.3.2";
+inline constexpr char toolVersion[] = "0.3.3";
 struct FaultData {
     LONG64 ordinal = 0, tick = 0;
+    std::uint64_t fileTime = 0;
     DWORD code = 0, thread = 0, flags = 0, parameterCount = 0;
     DWORD64 ip = 0, parameters[4]{}, registers[16]{};
     DWORD64 stackWords[32]{};
@@ -71,6 +74,11 @@ struct FrameSnapshot {
     LONG64 tick = 0, receivedTick = 0, count = 0;
     DWORD thread = 0;
     bool present = false;
+};
+enum class FrameReadStatus : unsigned char { NeverPublished, Coherent, Busy };
+struct FrameReadResult {
+    FrameSnapshot sample;
+    FrameReadStatus status = FrameReadStatus::NeverPublished;
 };
 // One writer-owned frame source. Keeping ETW and native publication in separate
 // records prevents a delayed callback from replacing a newer authoritative source.
@@ -92,9 +100,10 @@ public:
         InterlockedExchange(&writer_, 0);
         return true;
     }
-    FrameSnapshot snapshot() const noexcept {
+    FrameReadResult snapshot() const noexcept {
         for (unsigned attempt = 0; attempt < 4; ++attempt) {
             LONG before = InterlockedCompareExchange(const_cast<volatile LONG*>(&sequence_), 0, 0);
+            if (!before) return {};
             if (before & 1) continue;
             FrameSnapshot result;
             result.tick = InterlockedCompareExchange64(const_cast<volatile LONG64*>(&tick_), 0, 0);
@@ -105,10 +114,10 @@ public:
             LONG after = InterlockedCompareExchange(const_cast<volatile LONG*>(&sequence_), 0, 0);
             if (before == after && !(after & 1)) {
                 result.present = result.count != 0;
-                return result;
+                return {result, FrameReadStatus::Coherent};
             }
         }
-        return {};
+        return {{}, FrameReadStatus::Busy};
     }
 private:
     alignas(8) volatile LONG sequence_ = 0;
@@ -116,7 +125,7 @@ private:
     alignas(8) volatile LONG64 tick_ = 0, receivedTick_ = 0, count_ = 0;
 };
 struct alignas(8) Shared {
-    LONG signature = magic, version = 6;
+    LONG signature = magic, version = 7;
     DWORD pid = 0, runtime = 0, extender = 0;
     DWORD timeoutMs = 15000, loadingMs = 120000, startupMs = 180000, probeMs = 250;
     DWORD maxReports = 10, writeDump = 1, manualKey = VK_PAUSE;
@@ -177,5 +186,6 @@ void retain(const std::filesystem::path& folder, unsigned freezeLimit, unsigned 
 std::string eventHistory(Shared* state, LONG64 after = 0);
 bool validateDump(const std::filesystem::path& path, std::string& reason);
 std::string profile(HANDLE target, bool stacks, Shared* state, bool reset = false);
-std::string externalCrashEvidence(const std::filesystem::path& gameImage, Shared* state);
+std::string externalCrashEvidence(const std::filesystem::path& gameImage, Shared* state,
+                                  const std::vector<CrashModuleIdentity>& modules);
 }

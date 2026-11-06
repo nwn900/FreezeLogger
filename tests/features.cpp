@@ -25,12 +25,30 @@ int wmain(int argc, wchar_t** argv) {
         fs::FrameSignal native, etw;
         check(etw.publish(900, 905, 2), "ETW frame publication");
         auto etwSample = etw.snapshot();
-        check(etwSample.present && etwSample.count == 1 && etwSample.tick == 900, "coherent ETW frame snapshot");
-        auto selection = fs::selectFrameProvider(native.snapshot(), etwSample, true);
+        check(etwSample.status == fs::FrameReadStatus::Coherent && etwSample.sample.present &&
+              etwSample.sample.count == 1 && etwSample.sample.tick == 900, "coherent ETW frame snapshot");
+        fs::FrameProviderSelector selector;
+        auto selection = selector.select(native.snapshot(), etwSample, true);
         check(selection.source == 1 && selection.sample.tick == 900, "ETW fallback selected when native adapter is absent");
         check(native.publish(1000, 1001, 3), "native frame publication");
-        selection = fs::selectFrameProvider(native.snapshot(), etw.snapshot(), true);
+        selection = selector.select(native.snapshot(), etw.snapshot(), true);
         check(selection.source == 2 && selection.sample.tick == 1000, "native frame source outranks delayed ETW");
+        auto busy = fs::FrameReadResult{{}, fs::FrameReadStatus::Busy};
+        fs::FrameProviderSelector etwBusySelector;
+        fs::FrameSignal neverNative;
+        selection = etwBusySelector.select(neverNative.snapshot(), etwSample, true);
+        check(selection.source == 1, "ETW provider is available before a native source publishes");
+        selection = etwBusySelector.select(neverNative.snapshot(), busy, true);
+        check(selection.source == 1 && selection.sample.tick == 900,
+              "a busy ETW read retains its last coherent fallback sample");
+        fs::FrameProviderSelector busySelector;
+        selection = busySelector.select(busy, etwSample, true);
+        check(selection.source == 0, "a busy first native publication is not mistaken for absent native telemetry");
+        selection = busySelector.select(native.snapshot(), etw.snapshot(), true);
+        check(selection.source == 2, "coherent native publication becomes authoritative");
+        selection = busySelector.select(busy, etw.snapshot(), true);
+        check(selection.source == 2 && selection.sample.tick == 1000,
+              "a busy native read retains its last coherent sample and native authority");
         LONG64 eventTick = 0;
         check(fs::frameTickFromQpc(100000, 200000, 1000000, 10000, eventTick) && eventTick == 9900,
               "ETW presentation timestamp maps from QPC to monotonic milliseconds");
@@ -97,17 +115,35 @@ int wmain(int argc, wchar_t** argv) {
     }
     fs::History history(10000);
     fs::FrameGate frameGate;
-    check(!frameGate.sample(1000, 900, 10, true, true, false, 2000), "frame monitor arms after progress");
-    check(!frameGate.sample(1500, 1400, 11, true, true, false, 2000), "healthy frames");
-    check(frameGate.sample(4000, 1400, 11, true, true, false, 2000), "frame silence with queue progress detected");
-    check(!frameGate.sample(5000, 1400, 11, true, true, false, 2000), "one frame incident per stall");
-    check(!frameGate.sample(6000, 5900, 12, true, true, false, 2000), "frame recovery rearms");
-    check(frameGate.sample(9000, 5900, 12, true, true, false, 2000), "second independent frame incident");
-    check(!frameGate.sample(20000, 5900, 12, true, true, true, 2000), "loading suppresses frame capture");
-    check(!frameGate.sample(20001, 5900, 12, true, false, false, 2000), "background frames not assumed stalled");
-    check(!frameGate.sample(22000, 5900, 12, true, true, false, 2000), "focus resume requires fresh presentation");
-    check(!frameGate.sample(25000, 5900, 12, true, true, false, 2000), "stale background sample cannot arm");
-    check(!frameGate.sample(30000, 29000, 15, false, true, false, 2000), "unavailable ETW never triggers frame capture");
+    auto frame = [](LONG source, LONG64 tick, LONG64 count) {
+        fs::FrameSnapshot sample{tick, tick, count, 1, count != 0};
+        return fs::FrameSelection{sample, source};
+    };
+    check(!frameGate.sample(1000, frame(1, 900, 10), true, false, 2000), "frame monitor arms after eligibility");
+    check(!frameGate.sample(1500, frame(1, 1400, 11), true, false, 2000), "healthy frames");
+    check(frameGate.sample(4000, frame(1, 1400, 11), true, false, 2000), "frame silence with queue progress detected");
+    check(!frameGate.sample(5000, frame(1, 1400, 11), true, false, 2000), "one frame incident per stall");
+    check(!frameGate.sample(6000, frame(1, 5900, 12), true, false, 2000), "frame recovery rearms");
+    check(frameGate.sample(9000, frame(1, 5900, 12), true, false, 2000), "second independent frame incident");
+    check(!frameGate.sample(20000, frame(1, 5900, 12), true, true, 2000), "loading suppresses frame capture");
+    check(!frameGate.sample(20001, frame(1, 5900, 12), false, false, 2000), "background frames not assumed stalled");
+    check(!frameGate.sample(22000, frame(1, 5900, 12), true, false, 2000), "focus resume establishes a fresh deadline");
+    check(frameGate.sample(24000, frame(1, 5900, 12), true, false, 2000), "no fresh foreground presentation times out");
+    check(!frameGate.sample(30000, frame(0, 29000, 15), true, false, 2000), "unavailable ETW never triggers frame capture");
+    fs::FrameGate bufferedFrameGate;
+    check(!bufferedFrameGate.sample(8000, frame(1, 8000, 20), false, false, 2000), "background frame progress is ineligible");
+    check(!bufferedFrameGate.sample(10000, frame(1, 8000, 20), true, false, 2000), "foreground resume establishes a new eligibility baseline");
+    check(!bufferedFrameGate.sample(10200, frame(1, 8100, 21), true, false, 2000),
+          "buffered pre-resume presentation cannot trigger or rearm foreground monitoring");
+    check(bufferedFrameGate.sample(12000, frame(1, 8100, 21), true, false, 2000),
+          "frame silence is detected after the foreground eligibility timeout");
+    fs::FrameGate handoverGate;
+    check(!handoverGate.sample(1000, frame(1, 900, 100000), true, false, 2000), "ETW provider arms the frame gate");
+    check(!handoverGate.sample(1100, frame(1, 1050, 100001), true, false, 2000), "ETW progress advances its own counter");
+    check(!handoverGate.sample(1200, frame(2, 1190, 11), true, false, 2000), "native provider handover rebases source identity and count");
+    check(!handoverGate.sample(1210, frame(2, 1205, 12), true, false, 2000), "native progress advances after handover");
+    check(handoverGate.sample(3210, frame(2, 1205, 12), true, false, 2000),
+          "native stall is detected after handover despite its lower source counter");
     for (unsigned i = 0; i < 100; ++i) history.add(std::string(65536, 'x'));
     check(history.text().size() < 2 * 1024 * 1024 + 1024, "history bounded to 2 MiB");
     history.clear(); check(history.text().find("samples=0") != std::string::npos, "history reset");

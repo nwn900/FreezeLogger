@@ -179,7 +179,7 @@ def main() -> int:
             "game_startup_qualified": False,
             "gameplay_qualified": False,
             "deployed": False,
-            "external_crash_correlation": "edition, executable version, process start and five-minute window required",
+            "external_crash_correlation": "metadata and time produce a candidate; corroboration requires an exact in-process exception and loaded-module identity",
             "payloads": [
                 {"file": path.name, "bytes": path.stat().st_size, "sha256": sha256(path)}
                 for path in (binary, source)

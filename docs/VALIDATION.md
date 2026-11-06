@@ -1,5 +1,44 @@
 # Validation history
 
+## FreezeSentryF4 0.3.3 review follow-up, 2026-11-06
+
+The original November 5 crash report is in the Fallout 4 `F4SE` folder. Its
+header reports an access violation at `Fallout4.exe+1C152D6`. The 0.3.1
+collector's exit report recorded a nonzero game exit and first-chance exception
+history, but omitted the Buffout report because external-log correlation was
+only called during hang capture. Version 0.3.2 added the exit-path lookup.
+
+This follow-up closes the remaining review findings: ETW frame generation and
+receipt times stay distinct; foreground eligibility rejects buffered
+pre-resume frames; a busy native read retains native authority and its last
+coherent sample; provider handover rebases frame counts; and crash metadata/time
+is only a candidate until an exact in-process exception and loaded-module
+identity match. The parser accepts full module fields with dotted path segments,
+spaces and `C++` directories. The release verifier requires each file at its
+canonical ZIP root. Stateful frame selection, stall gating and crash
+corroboration are owned by focused objects.
+
+The MSVC `RelWithDebInfo` build passed. All 14 registered CTest cases are
+accounted for: 13 passed and `real-dxgi-etw` was skipped because Windows
+returned status 5. The release package and source archive passed the package
+gate, canonical ZIP verifier, and independent source-archive build. The Buffout
+parser regression uses the actual crash header and confirms exact exception,
+module and offset matching; a nearby but different process exception is
+rejected. This is a controlled fixture, not a reproduced game crash.
+
+The new DLL, watcher, PDBs and INI were deployed to the requested Vortex folder
+and the Fallout 4 `Data/F4SE/Plugins` paths. Both locations match the release
+payload by SHA-256, with the pre-update copies preserved under
+`deployments/2026-11-06-pre-0.3.3-update`.
+
+A direct `f4se_loader.exe` launch loaded the deployed DLL and watcher, wrote
+preflight data, and passed the qualified 1.10.163 context adapter. ETW remains
+unavailable (`status=5`). A SHA-256-verified copied test-save pair was prepared
+in the top-level save folder, but desktop capture timed out twice before the
+save could be selected. No save was loaded or written, and no gameplay or live
+crash-capture claim is made. Keep the GitHub issue open for the copied-save
+gameplay check and native ETW qualification.
+
 ## FreezeSentryF4 0.3.2 crash correlation and audit, 2026-11-06
 
 The November 5 Buffout log records an access violation at `Fallout4.exe+1C152D6`

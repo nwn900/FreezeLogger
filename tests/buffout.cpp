@@ -84,6 +84,39 @@ int wmain() {
         check(bare.found && bare.faultModule == "fallout 4.exe", "spaces in bare image names are retained");
     }
     {
+        fs::BuffoutCrashInfo dottedDirectory = fs::parseBuffoutCrashLog(
+            "Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x1000 C:\\Mods.dll\\Foo Bar.dll+0x12\n");
+        check(dottedDirectory.faultModule == "foo bar.dll" && dottedDirectory.faultOffset == "0x12",
+              "module extraction uses the final extension after a dotted directory");
+        fs::BuffoutCrashInfo dottedBasename = fs::parseBuffoutCrashLog(
+            "Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x1000 C:\\Mods\\Foo.dll Bar.dll+0x12\n");
+        check(dottedBasename.faultModule == "foo.dll bar.dll" && dottedBasename.faultOffset == "0x12",
+              "extension-like text inside the basename does not truncate the module field");
+        fs::BuffoutCrashInfo plusDirectory = fs::parseBuffoutCrashLog(
+            "Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x1000 C:\\C++\\Foo Bar.dll+0x12\n");
+        check(plusDirectory.faultModule == "foo bar.dll" && plusDirectory.faultOffset == "0x12",
+              "plus signs in a directory do not become the module offset delimiter");
+    }
+    {
+        auto crash = fs::parseBuffoutCrashLog(
+            "Fallout 4 v1.10.163\n"
+            "Unhandled exception \"EXCEPTION_ACCESS_VIOLATION\" at 0x7FF64B7552D6 Fallout4.exe+1C152D6\n");
+        check(crash.found && crash.exceptionCode == 0xC0000005u &&
+              crash.faultAddress == 0x7FF64B7552D6ULL && crash.faultModule == "fallout4.exe" &&
+              crash.faultOffset == "0x1c152d6",
+              "the reported Fallout 4 crash header retains its exact fault identity");
+        constexpr std::uint64_t written = 1'800'000'000ULL;
+        std::vector<fs::ProcessExceptionIdentity> exceptions{
+            {crash.exceptionCode, crash.faultAddress, written - 20'000'000ULL}};
+        std::vector<fs::CrashModuleIdentity> modules{
+            {0x7FF649B40000ULL, 0x3000000ULL, "Fallout4.exe"}};
+        check(fs::CrashIncidentCorrelator().assess(crash, written, exceptions, modules).corroborated,
+              "the reported fault identity can be tied to a same-session exception and Fallout4 image");
+        exceptions[0].address++;
+        check(!fs::CrashIncidentCorrelator().assess(crash, written, exceptions, modules).corroborated,
+              "a nearby but different process exception cannot corroborate the crash log");
+    }
+    {
         std::size_t cursor = 0;
         std::uint64_t value = 7;
         check(fs::buffout::parseHex("FFFFFFFFFFFFFFFF", cursor, value) &&
@@ -101,7 +134,23 @@ int wmain() {
                                     started, written + 600'000'000ULL};
         fs::CrashLogCorrelator correlator(session);
         auto match = correlator.assess(crash, written);
-        check(match.matched && match.ageMs == 60000, "same game edition/version and recent current process correlates");
+        check(match.candidate && match.ageMs == 60000,
+              "edition, version and age select a candidate without claiming process identity");
+        auto overlapping = session;
+        overlapping.processStartedFileTime -= 5'000'000ULL;
+        check(fs::CrashLogCorrelator(overlapping).assess(crash, written).candidate,
+              "overlapping sessions may see the same log as a candidate, never as a confirmed process match");
+        fs::CrashIncidentCorrelator incidentCorrelator;
+        std::vector<fs::ProcessExceptionIdentity> processExceptions{{0xC0000005u, 0x10, written - 10000}};
+        std::vector<fs::CrashModuleIdentity> loadedModules{{0x0e, 0x100, "Fallout4.exe"}};
+        check(incidentCorrelator.assess(crash, written, processExceptions, loadedModules).corroborated,
+              "exact current-process exception, loaded module and file time corroborate the incident");
+        check(!incidentCorrelator.assess(crash, written, {}, loadedModules).corroborated,
+              "a candidate without a current-process exception remains uncorroborated");
+        auto wrongModule = loadedModules;
+        wrongModule[0].basename = "Other.dll";
+        check(!incidentCorrelator.assess(crash, written, processExceptions, wrongModule).corroborated,
+              "a fault address outside the loaded module identity cannot corroborate the log");
         crash.edition = fs::BuffoutCrashInfo::Edition::Fallout4VR;
         check(correlator.assess(crash, written).reason == "game-edition-mismatch", "other game edition is context only");
         crash.edition = fs::BuffoutCrashInfo::Edition::Fallout4;

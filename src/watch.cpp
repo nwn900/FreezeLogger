@@ -38,7 +38,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     auto* state = static_cast<fs::Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(fs::Shared)));
     if (!state) return 3;
     struct Unmap { void* p; ~Unmap() { UnmapViewOfFile(p); } } unmap{state};
-    if (state->signature != fs::magic || state->version != 6 || !state->pid ||
+    if (state->signature != fs::magic || state->version != 7 || !state->pid ||
         state->timeoutMs < 2000 || state->timeoutMs > 3600000 ||
         state->loadingMs < 2000 || state->loadingMs > 3600000 ||
         state->startupMs < 2000 || state->startupMs > 3600000 ||
@@ -87,7 +87,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             std::ofstream preflight(folder / ("preflight-" + std::to_string(state->pid) + ".json"), std::ios::trunc);
             preflight << "{\n"
                       << "  \"tool\": \"FreezeSentryF4 " << fs::toolVersion << "\",\n"
-                      << "  \"shared_version\": 6,\n"
+                      << "  \"shared_version\": 7,\n"
                       << "  \"game_image\": \"" << fs::jsonEscape(fs::diagnosticPath(gameImage)) << "\",\n"
                       << "  \"pid\": " << state->pid << ",\n"
                       << "  \"runtime\": " << state->runtime << ",\n"
@@ -153,6 +153,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         LONG64 windowPulse = 0;
         LONG64 inventoryTime = 0;
         std::array<HMODULE, 2048> previousModules{}; DWORD previousModuleBytes = 0;
+        std::vector<fs::CrashModuleIdentity> processModules;
         auto collect = [&](const std::string& reason) {
             lifetime.budget(state->captureMs);
             session << "capture_started tick=" << fs::now() << " reason=" << reason << " collector_deadline_ms=" << state->captureMs
@@ -193,7 +194,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                             evidence << "exit_code=0x" << std::hex << exitCode << std::dec
                                      << " classification=" << (exitCode ? "nonzero_exit_unclassified" : "zero_exit") << '\n';
                         else evidence << "exit_code=unavailable classification=unknown_exit_status\n";
-                        evidence << fs::externalCrashEvidence(gameImage, state);
+                        evidence << fs::externalCrashEvidence(gameImage, state, processModules);
                         exceptionJournal.write(evidence);
                         evidence << contextEvidence()
                                  << fs::eventHistory(state) << history.text();
@@ -254,14 +255,20 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 if (EnumProcessModulesEx(target, modules.data(), sizeof(modules), &needed, LIST_MODULES_64BIT) &&
                     (needed != previousModuleBytes || modules != previousModules)) {
                     session << "LIVE_MODULE_INVENTORY tick=" << t << " (address context for later exit evidence)\n";
+                    std::vector<fs::CrashModuleIdentity> inventory;
                     for (size_t i = 0; i < std::min<size_t>(modules.size(), needed / sizeof(HMODULE)); ++i) {
                         MODULEINFO info{}; std::array<wchar_t, 32768> path{};
                         if (GetModuleInformation(target, modules[i], &info, sizeof(info)) &&
-                            GetModuleFileNameExW(target, modules[i], path.data(), static_cast<DWORD>(path.size())))
+                            GetModuleFileNameExW(target, modules[i], path.data(), static_cast<DWORD>(path.size()))) {
+                            auto imageName = fs::diagnosticUtf8(std::filesystem::path(path.data()).filename().wstring());
                             session << "base=0x" << std::hex << reinterpret_cast<DWORD64>(info.lpBaseOfDll) << " size=0x"
                                     << info.SizeOfImage << std::dec << ' ' << fs::diagnosticUtf8(path.data()) << '\n';
+                            inventory.push_back({reinterpret_cast<DWORD64>(info.lpBaseOfDll), info.SizeOfImage,
+                                                 std::move(imageName)});
+                        }
                     }
                     session.flush();
+                    if (!inventory.empty()) processModules.swap(inventory);
                     previousModules = modules; previousModuleBytes = needed;
                 }
                 inventoryTime = t;
@@ -303,16 +310,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 fs::profile(target, false, state, true);
                 profilePaused = paused;
                 earlyCount = 0;
-                frameGate.active = false;
+                frameGate.reset();
                 session << "tick=" << t << " profiling_paused=" << paused << " CPU baseline reset\n";
                 session.flush();
             }
             DWORD foregroundPID = 0;
             GetWindowThreadProcessId(GetForegroundWindow(), &foregroundPID);
-            frames.current();
-            auto frame = fs::read(state->frameTick);
-            bool frameAvailable = fs::read(state->frameCount) >= 10 &&
-                (fs::read(state->frameSource) == 2 || fs::read(state->frameStatus) == 0);
+            auto frameSelection = frames.current();
+            auto frame = frameSelection.sample.tick;
+            bool frameAvailable = frameSelection.source && frameSelection.sample.count >= 10;
             bool frameActive = state->frameMonitoring && frameAvailable && !paused && foregroundPID == state->pid;
             bool queuesSlow = main && ui && (t - main >= state->earlyMs || t - ui >= state->earlyMs);
             bool framesSlow = frameActive && t - frame >= state->earlyMs;
@@ -344,10 +350,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             if (fs::now() - contextTick >= 500) { currentContext = context.sample(); contextTick = fs::now(); }
             paused = fs::read(state->phase) != 0 || currentContext.loading() || !fs::read(state->ready);
             timeout = fs::read(state->phase) || currentContext.loading() ? state->loadingMs : state->timeoutMs;
-            frames.current();
-            frame = fs::read(state->frameTick);
-            frameAvailable = fs::read(state->frameCount) >= 10 &&
-                (fs::read(state->frameSource) == 2 || fs::read(state->frameStatus) == 0);
+            frameSelection = frames.current();
+            frame = frameSelection.sample.tick;
+            frameAvailable = frameSelection.source && frameSelection.sample.count >= 10;
             GetWindowThreadProcessId(GetForegroundWindow(), &foregroundPID);
             if (fs::read(state->ready) && gate.sample(t, fs::read(state->started), main, ui, timeout, state->startupMs)) {
                 std::string reason = !state->taskMonitoring ? "window-not-responding" : !main || !ui ? "startup-task-silence" :
@@ -387,7 +392,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             }
             if (wasReported && !gate.reported) { session << "tick=" << t << " queues recovered\n"; session.flush(); }
             wasReported = gate.reported;
-            bool frameIncident = frameGate.sample(t, frame, fs::read(state->frameCount), state->frameMonitoring && frameAvailable,
+            bool frameIncident = frameGate.sample(t, state->frameMonitoring ? frameSelection : fs::FrameSelection{},
                                                   foregroundPID == state->pid, paused, timeout);
             if (!gate.reported && frameIncident) {
                 collect("present-silence-with-task-progress"); lastPoll = fs::now();

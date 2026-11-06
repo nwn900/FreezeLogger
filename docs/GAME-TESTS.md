@@ -1,3 +1,25 @@
+# 0.3.3 candidate: crash identity and copied-save check
+
+The updated Vortex deployment was launched directly with `f4se_loader.exe`
+from the Fallout 4 directory. The plugin wrote `shared_version=7` preflight
+data, started the watcher, and passed the exact Fallout 4 1.10.163 context
+adapter. The session reports a readable initial context, but no named cell or
+cell name was observed because no save was loaded. It recorded the `MainMenu`,
+`FaderMenu`, `ButtonBarMenu` and `BingleBodyPartsUI` stack, plus a menu-open
+transition. DXGI ETW startup returned status 5.
+
+A test-save `.fos` and matching `.f4se` cosave were copied byte-for-byte into
+the top-level save folder; SHA-256 matched their source files. Desktop window
+capture timed out twice, so no UI input was sent and the copied save was not
+loaded. No save was written. The game remained open when this result was
+recorded; copied-save play, menu transitions, loading transitions, and the
+ten-minute observation remain untested. Do not count this launch as gameplay
+qualification.
+
+The exact November 5 crash-header format is covered by the Buffout regression
+test. It validates parsing and controlled process-identity matching only; no
+real Fallout 4 crash was reproduced.
+
 # 0.3.2 candidate: live game checks
 
 The direct F4SE startup smoke test completed on 2026-11-06 with Fallout 4
