@@ -56,6 +56,7 @@ public:
         const auto& sample = selection.sample;
         bool eligible = selection.source && sample.present && sample.count >= 10 && foreground && !loading;
         if (!eligible) { reset(); return false; }
+        if (sample.tick > now) return false;
         if (!active_ || source_ != selection.source || sample.count < lastCount_) {
             active_ = true;
             source_ = selection.source;

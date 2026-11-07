@@ -270,8 +270,8 @@ struct CrashIncidentMatch {
     std::string reason;
 };
 
-// Requires an exact first-chance exception and a loaded image identity from
-// this process before a time-compatible log can support incident attribution.
+// Requires an exact first-chance exception and loaded image before a log can
+// support incident corroboration; this does not prove which process wrote it.
 class CrashIncidentCorrelator final {
 public:
     CrashIncidentMatch assess(const BuffoutCrashInfo& crash, std::uint64_t logFileTime,
@@ -283,18 +283,28 @@ public:
         std::uint64_t expectedOffset = 0;
         if (!buffout::parseHex(crash.faultOffset, cursor, expectedOffset) || cursor != crash.faultOffset.size())
             return {false, 0, "crash-offset-invalid"};
-        constexpr std::uint64_t maximumDelta100ns = 5ULL * 60ULL * 1000ULL * 10000ULL;
+        constexpr std::uint64_t fileTimeTicksPerSecond = 10'000'000ULL;
+        // Coarse filesystem last-write times can place the log a little *before* the
+        // sampled exception time on FAT-family volumes; allow a small future skew only
+        // in that direction. A log written materially before the exception cannot be
+        // proven to record that exception (FSF4-09).
+        constexpr std::uint64_t logBeforeExceptionTolerance100ns = 2ULL * fileTimeTicksPerSecond;
+        constexpr std::uint64_t maximumExceptionToLogDelay100ns = 5ULL * 60ULL * fileTimeTicksPerSecond;
         for (const auto& exception : exceptions) {
             if (exception.code != crash.exceptionCode || exception.address != crash.faultAddress || !exception.fileTime)
                 continue;
-            const auto delta = logFileTime >= exception.fileTime
+            if (exception.fileTime > logFileTime) {
+                if (exception.fileTime - logFileTime > logBeforeExceptionTolerance100ns) continue;
+            } else {
+                if (logFileTime - exception.fileTime > maximumExceptionToLogDelay100ns) continue;
+            }
+            const auto delta100ns = logFileTime >= exception.fileTime
                 ? logFileTime - exception.fileTime : exception.fileTime - logFileTime;
-            if (delta > maximumDelta100ns) continue;
             for (const auto& module : modules) {
                 if (exception.address < module.base || exception.address - module.base >= module.size ||
                     buffout::lower(module.basename) != crash.faultModule ||
                     exception.address - module.base != expectedOffset) continue;
-                return {true, delta / 10000ULL, "exact-current-process-exception-and-loaded-module"};
+                return {true, delta100ns / 10000ULL, "matching-current-process-exception-and-loaded-module-corroboration"};
             }
         }
         return {false, 0, "no-matching-current-process-exception-and-loaded-module"};

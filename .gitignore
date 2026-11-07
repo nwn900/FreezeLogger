@@ -1,5 +1,7 @@
 # Local build and packaging output
 /build/
+/build-vs/
+/build-agent/
 /package/
 /artifacts/
 /out/

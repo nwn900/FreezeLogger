@@ -15,6 +15,16 @@ HANDLE mapping = nullptr;
 HANDLE companion = nullptr;
 std::filesystem::path dllFolder;
 fs::ExceptionJournal exceptionJournal;
+HHOOK closeHook = nullptr;
+LRESULT CALLBACK noteClose(int code, WPARAM wParam, LPARAM lParam) {
+    if (code == HC_ACTION && state) {
+        auto* message = reinterpret_cast<CWPSTRUCT*>(lParam);
+        if (message && (message->message == WM_CLOSE ||
+            (message->message == WM_SYSCOMMAND && (message->wParam & 0xFFF0) == SC_CLOSE)))
+            InterlockedExchange(&state->userClose, 1);
+    }
+    return CallNextHookEx(closeHook, code, wParam, lParam);
+}
 struct PreserveError { DWORD value = GetLastError(); ~PreserveError() { SetLastError(value); } };
 bool record(const fs::EventData& data) {
     if (!state || fs::read(state->ready) < 0) return false;
@@ -172,6 +182,10 @@ bool load(const fs::Host* host) {
         bool keep = false;
         ~PendingMapping() {
             if (!keep && state) {
+                if (state->crashEvent) {
+                    CloseHandle(reinterpret_cast<HANDLE>(state->crashEvent));
+                    state->crashEvent = 0;
+                }
                 InterlockedExchange(&state->ready, -1);
                 UnmapViewOfFile(state); CloseHandle(mapping); state = nullptr; mapping = nullptr;
                 if (companion) { CloseHandle(companion); companion = nullptr; }
@@ -206,6 +220,9 @@ bool load(const fs::Host* host) {
     state->frameMonitoring = setting(ini, L"FrameMonitoring", 1, 0, 1);
     state->captureMs = setting(ini, L"CaptureTimeoutSeconds", 120, 15, 900) * 1000;
     state->contextMonitoring = setting(ini, L"ContextMonitoring", 1, 0, 1);
+    state->crashCapture = setting(ini, L"CrashCapture", 1, 0, 1);
+    if (HANDLE crashEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr))
+        state->crashEvent = reinterpret_cast<ULONG_PTR>(crashEvent);
     state->manualKey = setting(ini, L"ManualKey", VK_PAUSE, 0, 255);
     GetPrivateProfileStringW(L"FreezeSentryF4", L"ReportDirectory", L"", state->outputDirectory, 1024, ini.c_str());
     if (!startHelper()) return false;
@@ -233,7 +250,21 @@ bool load(const fs::Host* host) {
     }
     InterlockedExchange(&state->ready, 1);
     if (!exceptionJournal.install(state)) startupLog("Native exception breadcrumbs unavailable");
-    else startupLog("Native exception observer installed (first VEH position requested; pass-through)");
+    else startupLog("Native exception observer installed (first VEH position requested; pass-through; fatal codes request a live dump)");
+    closeHook = SetWindowsHookExW(WH_CALLWNDPROC, noteClose, module, GetCurrentThreadId());
+    struct CloseWindow { DWORD pid; DWORD thread = 0; };
+    CloseWindow game{GetCurrentProcessId()};
+    EnumWindows([](HWND window, LPARAM parameter) -> BOOL {
+        auto& game = *reinterpret_cast<CloseWindow*>(parameter);
+        DWORD pid = 0;
+        DWORD thread = GetWindowThreadProcessId(window, &pid);
+        if (pid == game.pid && IsWindowVisible(window) && !GetWindow(window, GW_OWNER)) {
+            game.thread = thread; return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&game));
+    if (game.thread && game.thread != GetCurrentThreadId())
+        SetWindowsHookExW(WH_CALLWNDPROC, noteClose, module, game.thread);
     startupLog("Loaded, runtime=" + std::to_string(state->runtime) + ", PID=" + std::to_string(state->pid) +
                ", task_monitoring=" + std::to_string(state->taskMonitoring));
     return true;

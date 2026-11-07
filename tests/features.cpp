@@ -144,6 +144,15 @@ int wmain(int argc, wchar_t** argv) {
     check(!handoverGate.sample(1210, frame(2, 1205, 12), true, false, 2000), "native progress advances after handover");
     check(handoverGate.sample(3210, frame(2, 1205, 12), true, false, 2000),
           "native stall is detected after handover despite its lower source counter");
+    fs::FrameGate interleavedClockGate;
+    check(!interleavedClockGate.sample(1000, frame(1, 900, 10), true, false, 2000),
+          "interleaved-clock frame gate arms");
+    check(!interleavedClockGate.sample(3000, frame(1, 3001, 11), true, false, 2000),
+          "future frame timestamp is deferred without consuming its counter");
+    check(!interleavedClockGate.sample(3002, frame(1, 3001, 11), true, false, 2000),
+          "same frame is credited when the post-snapshot clock catches up");
+    check(interleavedClockGate.sample(5003, frame(1, 3001, 11), true, false, 2000),
+          "frame silence is detected after the credited interleaved frame");
     for (unsigned i = 0; i < 100; ++i) history.add(std::string(65536, 'x'));
     check(history.text().size() < 2 * 1024 * 1024 + 1024, "history bounded to 2 MiB");
     history.clear(); check(history.text().find("samples=0") != std::string::npos, "history reset");

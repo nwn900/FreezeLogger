@@ -5,12 +5,14 @@ collector. The DLL uses public F4SE interfaces; no Address Library, CommonLib
 or game memory patches. A separately gated collector adapter reads engine
 context only from a qualified 1.10.163 executable.
 
-Version 0.3.3 fixes frame resume and provider-handover edge cases, preserves
-native frame authority during concurrent reads, requires process exception and
-loaded-module evidence before crash-log corroboration, parses complete module
-fields, and verifies the canonical ZIP layout. Edition, version, and time only
-identify a candidate; incident corroboration also needs the exact in-process
-exception and matching loaded image. See
+Version 0.3.6 adds a live crash minidump on fatal exceptions and raises the
+loading hang threshold from observed
+load times. Version 0.3.5 closes crash-log chronology (exception must precede log write within
+limits), samples the frame provider immediately before the frame stall decision, verifies
+matching PDB identities in diagnostic packages, and retains the 0.3.3 frame,
+parser, and packaging fixes. Edition, version, and time identify candidates;
+matching exception and loaded-module evidence only corroborate a log and do not
+prove which overlapping same-version process wrote it. See
 [validation](docs/VALIDATION.md) for evidence and limits.
 
 ## Install
@@ -153,6 +155,16 @@ threads, stacks and indirectly referenced memory instead.
 
 ## Crashes and repair
 
+A fatal exception (access violation, heap corruption, stack overflow, and the
+other codes Tullius treats as fatal) publishes one crash incident. The watcher
+wakes on that event and writes a single `crash-*.dmp` plus report while the
+process is still alive. It does not swallow the exception. An unhandled C++
+exception, or `abort()` within 500 ms of a C++ throw on that thread, uses the
+same one-shot path. `CrashCapture=0` leaves the journal in place and skips the
+dump. Completed loads can raise `LoadingTimeoutSeconds` using the 90th
+percentile plus half that time, at least 30 seconds of margin, and never above
+one hour. Alt+F4 / window close sets `user-close` on a zero exit.
+
 The exception journal records up to 512 selected first-chance native/C++
 exceptions and always returns `EXCEPTION_CONTINUE_SEARCH`. It requests the first
 position in the vectored-handler chain so it can observe faults before handlers
@@ -195,16 +207,23 @@ qualification of all game executables. See [validation](docs/VALIDATION.md).
 From an x64 MSVC developer shell with CMake/Ninja:
 
 ```powershell
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+  -DFSF4_SYMBOLS_MODE=required
 cmake --build build
 ctest --test-dir build --output-on-failure `
-  --output-junit "$((Get-Location).Path)\build\validation-0.3.3.xml"
-python scripts/package.py --build build --config RelWithDebInfo `
-  --stage build/package-0.3.3-release --artifacts artifacts/release-0.3.3 `
-  --test-report build/validation-0.3.3.xml
-python scripts/verify_release.py --build build --config RelWithDebInfo `
-  --package build/package-0.3.3-release
+  --output-junit "$((Get-Location).Path)\build\validation-0.3.6.xml"
+python scripts/package.py --build build --config RelWithDebInfo --symbols-mode required `
+  --stage build/package-0.3.6-release --artifacts artifacts/release-0.3.6 `
+  --test-report build/validation-0.3.6.xml
+python scripts/verify_release.py --build build --config RelWithDebInfo --symbols-mode required `
+  --package build/package-0.3.6-release
 ```
+
+The default diagnostic package requires both compiler PDBs and checks their
+GUID/age against the packaged DLL and watcher. A deliberate symbols-free package
+must configure CMake with `-DFSF4_SYMBOLS_MODE=none` and pass
+`--symbols-mode none` to the packager and verifier; that mode rejects any PDB in
+the package.
 
 The ABI verifier uses Python/7-Zip and downloads public SDK evidence into
 `build/sdk-evidence`; those headers are not linked or redistributed. Tests stage

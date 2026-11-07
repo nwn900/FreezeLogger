@@ -36,7 +36,7 @@ def build_artifact(build: Path, name: str, config: str) -> Path:
     raise RuntimeError(f"missing build output {name} under {build}")
 
 
-def build_source_archive(archive_path: Path, build: Path, config: str) -> None:
+def build_source_archive(archive_path: Path, build: Path, config: str, symbols_mode: str) -> None:
     cache = (build / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
     generator = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.+)$", cache, re.M)
     platform = re.search(r"^CMAKE_GENERATOR_PLATFORM:INTERNAL=(.*)$", cache, re.M)
@@ -57,6 +57,7 @@ def build_source_archive(archive_path: Path, build: Path, config: str) -> None:
             command = ["cmake", "-S", str(source_root), "-B", str(source_build), "-G", generator.group(1)]
             if platform and platform.group(1):
                 command += ["-A", platform.group(1)]
+            command += [f"-DFSF4_SYMBOLS_MODE:STRING={symbols_mode}"]
             subprocess.run(command, check=True)
             subprocess.run(["cmake", "--build", str(source_build), "--config", config, "--parallel"], check=True)
 
@@ -64,7 +65,9 @@ def build_source_archive(archive_path: Path, build: Path, config: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build", type=Path, default=ROOT / "build/audit-baseline")
-    parser.add_argument("--config", default="Release")
+    parser.add_argument("--config", default="RelWithDebInfo")
+    parser.add_argument("--symbols-mode", choices=("required", "none"), default="required",
+                        help="package matching PDBs or deliberately create a symbols-free package")
     parser.add_argument("--stage", type=Path, default=ROOT / f"build/package-{VERSION}")
     parser.add_argument("--artifacts", type=Path, default=ROOT / "artifacts")
     parser.add_argument("--test-report", type=Path, default=ROOT / f"build/validation-{VERSION}.xml",
@@ -74,6 +77,11 @@ def main() -> int:
     stage = args.stage.resolve()
     artifacts = args.artifacts.resolve()
     report = args.test_report.resolve()
+    cache = (build / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
+    configured_symbols = re.search(r"^FSF4_SYMBOLS_MODE:STRING=(required|none)$", cache, re.M)
+    required(configured_symbols is not None, f"CMake cache has no valid FSF4_SYMBOLS_MODE: {build / 'CMakeCache.txt'}")
+    required(configured_symbols.group(1) == args.symbols_mode,
+             f"package symbols mode {args.symbols_mode} differs from CMake mode {configured_symbols.group(1)}")
 
     inventory = subprocess.run(
         ["ctest", "--test-dir", str(build), "-C", args.config, "--show-only=json-v1"],
@@ -110,6 +118,14 @@ def main() -> int:
         required((plugin_dir / "FreezeSentryF4Watch.exe").read_bytes() == watch.read_bytes(), "installed watcher differs from build output")
         required((plugin_dir / "FreezeSentryF4.ini").read_bytes() ==
                  (ROOT / "dist/F4SE/Plugins/FreezeSentryF4.ini").read_bytes(), "installed INI differs from source INI")
+        if args.symbols_mode == "required":
+            for name in ("FreezeSentryF4.pdb", "FreezeSentryF4Watch.pdb"):
+                staged_pdb = plugin_dir / name
+                built_pdb = build_artifact(build, name, args.config)
+                required(staged_pdb.read_bytes() == built_pdb.read_bytes(), f"installed PDB differs from build output: {name}")
+        else:
+            required(not any(path.is_file() and path.suffix.lower() == ".pdb" for path in stage.rglob("*")),
+                     "symbols-free stage unexpectedly contains PDB files")
 
         manifest = stage / "FreezeSentryF4/SHA256SUMS.txt"
         payload = sorted(path for path in stage.rglob("*") if path.is_file() and path != manifest)
@@ -162,10 +178,10 @@ def main() -> int:
         for package_path in (stage, binary):
             subprocess.run([
                 sys.executable, str(verifier), "--build", str(build), "--config", args.config,
-                "--package", str(package_path),
+                "--package", str(package_path), "--symbols-mode", args.symbols_mode,
             ], check=True)
 
-        build_source_archive(source, build, args.config)
+        build_source_archive(source, build, args.config, args.symbols_mode)
 
         checksums.write_text("".join(
             f"{sha256(path)}  {path.name}\n" for path in (binary, source)
@@ -176,6 +192,7 @@ def main() -> int:
             "tests_registered": len(expected_tests),
             "tests_passed": len(tests) - len(skipped),
             "tests_skipped": skipped,
+            "symbols_mode": args.symbols_mode,
             "game_startup_qualified": False,
             "gameplay_qualified": False,
             "deployed": False,

@@ -395,7 +395,7 @@ std::string externalCrashReport(const ExternalCrash& external) {
         << (external.info.faultModule.empty() ? "unknown-module" : external.info.faultModule)
         << (external.info.faultOffset.empty() ? "" : "+" + external.info.faultOffset) << '\n';
     if (!external.info.stackModules.empty()) out << "external_top_frame=" << external.info.stackModules.front() << '\n';
-    out << "The fault matches this process's exception and loaded module; this corroborates the incident, not its cause.\n";
+    out << "The fault matches this process's exception and loaded module; this corroborates the incident but does not prove which overlapping same-version process wrote the log or establish its cause.\n";
     return out.str();
 }
 std::string externalCrashEvidence(const std::filesystem::path& gameImage, Shared* state,
@@ -507,14 +507,15 @@ std::string profile(HANDLE target, bool stacks, Shared* state, bool reset) {
     return out.str();
 }
 bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
-             const std::string& reason, Shared* state, bool dump, const std::string& history) {
+             const std::string& reason, Shared* state, bool dump, const std::string& history, bool quick) {
     ExceptionJournal exceptionJournal(state);
     const auto gameImage = processImage(target);
     SYSTEMTIME utc{}; GetSystemTime(&utc);
     std::ostringstream stem;
     // Manual snapshots use their own name class so per-category retention caps
     // (MaxFreezeReports/MaxManualReports) can keep each class independently.
-    stem << (reason == "manual-capture" ? "manual-" : "freeze-") << std::setfill('0') << std::setw(4) << utc.wYear << std::setw(2) << utc.wMonth
+    const char* prefix = reason == "manual-capture" ? "manual-" : reason == "fatal-exception" ? "crash-" : "freeze-";
+    stem << prefix << std::setfill('0') << std::setw(4) << utc.wYear << std::setw(2) << utc.wMonth
          << std::setw(2) << utc.wDay << '-' << std::setw(2) << utc.wHour << std::setw(2) << utc.wMinute
          << std::setw(2) << utc.wSecond << '-' << std::setw(3) << utc.wMilliseconds << '-' << pid;
     auto logPath = folder / (stem.str() + ".log");
@@ -534,6 +535,10 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
                 << " pending=" << read(state->pending[c]) << '\n';
         log << "last_F4SE_event=" << read(state->event) << " event_tick=" << read(state->eventTime)
             << " loading_or_saving=" << read(state->phase) << '\n';
+        if (reason == "fatal-exception")
+            log << "crash_code=0x" << std::hex << state->crashCode << std::dec
+                << " crash_thread=" << state->crashThread << " crash_address=0x" << std::hex
+                << state->crashAddress << std::dec << " capture=single-snapshot\n";
     }
     PROCESS_MEMORY_COUNTERS_EX memory{}; memory.cb = sizeof(memory);
     if (GetProcessMemoryInfo(target, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory)))
@@ -554,9 +559,10 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     std::vector<Module> lastModules;
     std::vector<DWORD> threadIDs;
     bool sampled = false;
-    for (unsigned sample = 0; sample < 3; ++sample) {
+    const unsigned sampleCount = quick ? 1u : 3u;
+    for (unsigned sample = 0; sample < sampleCount; ++sample) {
     if (sample) Sleep(1000);
-    log << "\nSAMPLE " << sample + 1 << "/3 tick=" << now() << '\n';
+    log << "\nSAMPLE " << sample + 1 << '/' << sampleCount << " tick=" << now() << '\n';
     Snapshot snapshot;
     snapshot.log = &log;
     if (!commitAvailableForClone()) {

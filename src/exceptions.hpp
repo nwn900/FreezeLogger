@@ -1,5 +1,7 @@
 #pragma once
 #include "shared.hpp"
+#include "crash.hpp"
+#include <csignal>
 #include <algorithm>
 #include <ostream>
 #include <vector>
@@ -40,6 +42,13 @@ public:
             active_ = nullptr;
             state_ = nullptr;
             return false;
+        }
+        if (!previousFilter_)
+            previousFilter_ = SetUnhandledExceptionFilter(unhandled);
+        if (!abortInstalled_) {
+            auto previous = std::signal(SIGABRT, abortSignal);
+            previousAbort_ = previous == SIG_ERR ? nullptr : previous;
+            abortInstalled_ = true;
         }
         return true;
     }
@@ -173,10 +182,52 @@ private:
         InterlockedIncrement(&slot.sequence);
         InterlockedExchange64(&state_->faultCount, ordinal);
         InterlockedExchange(&state_->faultWriting, 0);
+        if (code == 0xE06D7363u) {
+            keptCppThread_ = GetCurrentThreadId();
+            keptCppTick_ = slot.data.tick;
+            keptCppAddress_ = slot.data.ip;
+        } else if (isFatalExceptionCode(code)) {
+            publishCrash(code, record.ExceptionAddress);
+        }
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    bool publishCrash(DWORD code, const void* address) noexcept {
+        if (!state_ || !state_->crashCapture) return false;
+        if (InterlockedCompareExchange(&state_->crashSequence, 1, 0) != 0) return false;
+        state_->crashCode = code;
+        state_->crashThread = GetCurrentThreadId();
+        state_->crashAddress = reinterpret_cast<DWORD64>(address);
+        MemoryBarrier();
+        InterlockedExchange(&state_->crashSequence, 2);
+        if (state_->crashEvent) SetEvent(reinterpret_cast<HANDLE>(state_->crashEvent));
+        return true;
+    }
+
+    static LONG WINAPI unhandled(EXCEPTION_POINTERS* exception) {
+        if (active_ && exception && exception->ExceptionRecord &&
+            !isFatalExceptionCode(exception->ExceptionRecord->ExceptionCode) &&
+            !isIgnoredUnhandledCode(exception->ExceptionRecord->ExceptionCode))
+            active_->publishCrash(exception->ExceptionRecord->ExceptionCode, exception->ExceptionRecord->ExceptionAddress);
+        auto previous = previousFilter_;
+        return previous ? previous(exception) : EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    static void __cdecl abortSignal(int signalNumber) {
+        if (active_ && keptCppThread_ == GetCurrentThreadId() && keptCppTick_ &&
+            now() - keptCppTick_ <= 500)
+            active_->publishCrash(0xE06D7363u, reinterpret_cast<void*>(keptCppAddress_));
+        auto previous = previousAbort_;
+        if (previous && previous != SIG_DFL && previous != SIG_IGN) previous(signalNumber);
+    }
+
     inline static ExceptionJournal* active_ = nullptr;
+    inline static LPTOP_LEVEL_EXCEPTION_FILTER previousFilter_ = nullptr;
+    inline static void (__cdecl* previousAbort_)(int) = nullptr;
+    inline static bool abortInstalled_ = false;
+    inline static DWORD keptCppThread_ = 0;
+    inline static LONG64 keptCppTick_ = 0;
+    inline static DWORD64 keptCppAddress_ = 0;
     Shared* state_ = nullptr;
     PVOID handler_ = nullptr;
 };

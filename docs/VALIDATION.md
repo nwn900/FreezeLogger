@@ -1,5 +1,45 @@
 # Validation history
 
+## FreezeSentryF4 0.3.6 Tullius capture paths, 2026-11-07
+
+Live fatal-exception dumps and an adaptive
+loading threshold follow the capture behavior of Tullius CTD Logger. The WinUI
+viewer, dump analyzer, resource hooks, and Address Library game hooks are not
+part of this port. Shared memory is version 8.
+
+## FreezeSentryF4 0.3.5 audit follow-up, 2026-11-07
+
+[GitHub issue #1](https://github.com/nwn900/FreezeSentryF4/issues/1) third-audit
+follow-up: incident corroboration now rejects a log written a full minute
+before the matching in-process exception (only a small last-write skew toward a
+later exception remains for FAT-style timestamp quantization). The watcher takes
+the latest frame snapshot immediately before the frame-stall decision so the
+gate's decision clock cannot lag an interleaved fresh Present. Release packaging
+still requires both matching PDBs by default; symbols-free mode remains explicit.
+
+## FreezeSentryF4 0.3.4 audit follow-up, 2026-11-06
+
+The third audit found three gaps. Crash-log corroboration now requires the
+matching current-process exception to precede the log's last-write timestamp,
+allowing at most two seconds of future skew for coarse filesystem timestamp
+granularity; the earlier five-minute maximum delay still applies. Corroboration
+is explicitly described as evidence, not proof of which overlapping process
+wrote the log or of crash cause. The frame watcher now takes its monotonic
+decision time after reading the latest frame snapshot, and a future-dated
+snapshot is deferred without consuming its progress count. Release packaging
+requires both matching PDBs by default and checks their CodeView GUID/age
+against their binaries. A symbols-free package must explicitly select
+`--symbols-mode none`.
+
+The MSVC `RelWithDebInfo` build succeeded (`Visual Studio 18 2026`, `-A x64`,
+`build-vs/`). All 14 registered CTest cases are accounted for: 13 passed and
+`real-dxgi-etw` skipped because ETW startup returned status 5. This is not ETW
+qualification. Fresh-built `FreezeSentryF4.dll`, `FreezeSentryF4Watch.exe`, and
+matching PDBs are copied to `deployments/2026-11-07-pre-0.3.5-local/` (ignored
+by git) for handoff into a mod or `Data\F4SE\Plugins` tree. Packaging was not
+run in this session; run `scripts/package.py` after a full JUnit receipt when you
+need a release ZIP.
+
 ## FreezeSentryF4 0.3.3 review follow-up, 2026-11-06
 
 The original November 5 crash report is in the Fallout 4 `F4SE` folder. Its

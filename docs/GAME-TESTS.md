@@ -1,4 +1,4 @@
-# 0.3.3 candidate: crash identity and copied-save check
+# 0.3.5 candidate: crash identity and copied-save check
 
 The updated Vortex deployment was launched directly with `f4se_loader.exe`
 from the Fallout 4 directory. The plugin wrote `shared_version=7` preflight

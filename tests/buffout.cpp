@@ -144,7 +144,21 @@ int wmain() {
         std::vector<fs::ProcessExceptionIdentity> processExceptions{{0xC0000005u, 0x10, written - 10000}};
         std::vector<fs::CrashModuleIdentity> loadedModules{{0x0e, 0x100, "Fallout4.exe"}};
         check(incidentCorrelator.assess(crash, written, processExceptions, loadedModules).corroborated,
-              "exact current-process exception, loaded module and file time corroborate the incident");
+              "exact current-process exception and loaded module corroborate the incident");
+        auto recentCandidate = correlator.assess(crash, written);
+        auto laterException = processExceptions;
+        laterException[0].fileTime = written + 600'000'000ULL;
+        check(recentCandidate.candidate &&
+              !incidentCorrelator.assess(crash, written, laterException, loadedModules).corroborated,
+              "an exception one minute after log write leaves the log as a recent candidate");
+        auto toleratedFileTimeSkew = processExceptions;
+        toleratedFileTimeSkew[0].fileTime = written + 20'000'000ULL;
+        check(incidentCorrelator.assess(crash, written, toleratedFileTimeSkew, loadedModules).corroborated,
+              "two-second filesystem timestamp quantization is tolerated");
+        auto excessiveFileTimeSkew = processExceptions;
+        excessiveFileTimeSkew[0].fileTime = written + 20'000'001ULL;
+        check(!incidentCorrelator.assess(crash, written, excessiveFileTimeSkew, loadedModules).corroborated,
+              "future exception times beyond filesystem timestamp tolerance are rejected");
         check(!incidentCorrelator.assess(crash, written, {}, loadedModules).corroborated,
               "a candidate without a current-process exception remains uncorroborated");
         auto wrongModule = loadedModules;

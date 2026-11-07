@@ -58,7 +58,7 @@ inline std::string jsonEscape(std::string_view value) {
 }
 inline constexpr LONG magic = 0x46534634;
 inline constexpr LONG faultCapacity = 512;
-inline constexpr char toolVersion[] = "0.3.3";
+inline constexpr char toolVersion[] = "0.3.6";
 struct FaultData {
     LONG64 ordinal = 0, tick = 0;
     std::uint64_t fileTime = 0;
@@ -125,7 +125,7 @@ private:
     alignas(8) volatile LONG64 tick_ = 0, receivedTick_ = 0, count_ = 0;
 };
 struct alignas(8) Shared {
-    LONG signature = magic, version = 7;
+    LONG signature = magic, version = 8;
     DWORD pid = 0, runtime = 0, extender = 0;
     DWORD timeoutMs = 15000, loadingMs = 120000, startupMs = 180000, probeMs = 250;
     DWORD maxReports = 10, writeDump = 1, manualKey = VK_PAUSE;
@@ -150,6 +150,11 @@ struct alignas(8) Shared {
     volatile LONG frameSource = 0, frameStatus = 0, frameThread = 0;
     FrameSignal nativeFrames, etwFrames;
     EventSlot events[128];
+    // One live crash incident. Sequence 0 = none, 1 = writing, 2 = published.
+    volatile LONG crashSequence = 0, crashAck = 0, userClose = 0;
+    DWORD crashCapture = 1, crashCode = 0, crashThread = 0;
+    DWORD64 crashAddress = 0;
+    ULONG_PTR crashEvent = 0;
 };
 inline LONG64 read(volatile LONG64& value) { return InterlockedCompareExchange64(&value, 0, 0); }
 inline LONG read(volatile LONG& value) { return InterlockedCompareExchange(&value, 0, 0); }
@@ -180,7 +185,8 @@ struct StallGate {
 };
 std::filesystem::path reportRoot(bool vr);
 bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
-             const std::string& reason, Shared* state, bool dump, const std::string& history = {});
+             const std::string& reason, Shared* state, bool dump, const std::string& history = {},
+             bool quick = false);
 void retain(const std::filesystem::path& folder, unsigned freezeLimit, unsigned manualLimit, unsigned storageMB = 0,
             const std::filesystem::path& protectedFile = {});
 std::string eventHistory(Shared* state, LONG64 after = 0);

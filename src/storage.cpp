@@ -104,7 +104,7 @@ void retain(const std::filesystem::path& folder, unsigned freezeLimit, unsigned 
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return;
     struct File { std::filesystem::path path; std::uintmax_t size; std::filesystem::file_time_type time; bool dump; };
     std::vector<File> files;
-    static const std::wregex owned(LR"(((freeze|manual)-[0-9]{8}-[0-9]{6}-[0-9]{3}-[0-9]+\.(log|dmp|dmp\.partial)|(session|exit-evidence|prehang)-[0-9]+\.log|prehang-[0-9]+\.log\.partial|preflight-[0-9]+\.json))");
+    static const std::wregex owned(LR"(((freeze|manual|crash)-[0-9]{8}-[0-9]{6}-[0-9]{3}-[0-9]+\.(log|dmp|dmp\.partial)|(session|exit-evidence|prehang)-[0-9]+\.log|prehang-[0-9]+\.log\.partial|preflight-[0-9]+\.json))");
     std::error_code error;
     auto iterator = std::filesystem::directory_iterator(folder, error);
     const auto iteratorEnd = std::filesystem::directory_iterator{};
@@ -122,7 +122,7 @@ void retain(const std::filesystem::path& folder, unsigned freezeLimit, unsigned 
     for (const auto& file : files)
         if (file.path.extension() == L".log") {
             auto name = file.path.filename().wstring();
-            if (name.starts_with(L"freeze-")) freezeLogs.push_back(file.path);
+            if (name.starts_with(L"freeze-") || name.starts_with(L"crash-")) freezeLogs.push_back(file.path);
             else if (name.starts_with(L"manual-")) manualLogs.push_back(file.path);
         }
     auto current = protectedFile.stem().wstring();
@@ -144,7 +144,7 @@ void retain(const std::filesystem::path& folder, unsigned freezeLimit, unsigned 
     for (const auto& file : files) {
         auto name = file.path.filename().wstring();
         for (const auto& active : activePids) {
-            if (!name.starts_with(L"freeze-") && !name.starts_with(L"manual-")) continue;
+            if (!name.starts_with(L"freeze-") && !name.starts_with(L"manual-") && !name.starts_with(L"crash-")) continue;
             if (!name.ends_with(L"-" + active + L".log")) continue;
             auto found = liveNewest.find(active);
             if (found == liveNewest.end() || file.time > found->second.time)

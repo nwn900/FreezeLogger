@@ -10,6 +10,7 @@
 #include "frames.hpp"
 #include "lifetime.hpp"
 #include "context.hpp"
+#include "crash.hpp"
 #include <sstream>
 
 namespace {
@@ -38,7 +39,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     auto* state = static_cast<fs::Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(fs::Shared)));
     if (!state) return 3;
     struct Unmap { void* p; ~Unmap() { UnmapViewOfFile(p); } } unmap{state};
-    if (state->signature != fs::magic || state->version != 7 || !state->pid ||
+    if (state->signature != fs::magic || state->version != 8 || !state->pid ||
         state->timeoutMs < 2000 || state->timeoutMs > 3600000 ||
         state->loadingMs < 2000 || state->loadingMs > 3600000 ||
         state->startupMs < 2000 || state->startupMs > 3600000 ||
@@ -87,7 +88,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             std::ofstream preflight(folder / ("preflight-" + std::to_string(state->pid) + ".json"), std::ios::trunc);
             preflight << "{\n"
                       << "  \"tool\": \"FreezeSentryF4 " << fs::toolVersion << "\",\n"
-                      << "  \"shared_version\": 7,\n"
+                      << "  \"shared_version\": 8,\n"
                       << "  \"game_image\": \"" << fs::jsonEscape(fs::diagnosticPath(gameImage)) << "\",\n"
                       << "  \"pid\": " << state->pid << ",\n"
                       << "  \"runtime\": " << state->runtime << ",\n"
@@ -146,6 +147,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         fs::retain(folder, state->maxFreezeReports, state->maxManualReports, state->storageMB, sessionPath);
         fs::StallGate gate;
         fs::HangSuppressionPolicy suppression;
+        fs::LoadingStats loadingStats;
+        bool loadingActive = false;
+        LONG64 loadingBegan = 0;
+        HANDLE crashWait = nullptr;
+        if (state->crashEvent && !DuplicateHandle(target, reinterpret_cast<HANDLE>(state->crashEvent),
+                GetCurrentProcess(), &crashWait, SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, 0))
+            crashWait = nullptr;
         bool suppressionLogged = false;
         LONG lastEvent = -2;
         LONG64 lastEventTime = -1, lastPoll = fs::now(), lastManual = 0;
@@ -161,7 +169,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             session.flush();
             try {
                 bool complete = fs::capture(target, state->pid, folder, reason, state, state->writeDump != 0,
-                    contextEvidence() + history.text());
+                    contextEvidence() + history.text(), reason == "fatal-exception");
                 session << "tick=" << fs::now() << " incident=" << reason << " collection_complete=" << complete << '\n';
                 fs::retain(folder, state->maxFreezeReports, state->maxManualReports, state->storageMB, sessionPath);
             } catch (const std::exception& error) {
@@ -172,12 +180,40 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         };
         enum class StopReason { TargetExited, CompanionUnavailable, TargetWaitFailed, UnexpectedWaitResult };
         StopReason stopReason = StopReason::TargetExited;
+        auto hangTimeout = [&] {
+            bool loading = fs::read(state->phase) || currentContext.loading();
+            if (loading && !loadingActive) { loadingActive = true; loadingBegan = fs::now(); }
+            if (!loading && loadingActive) {
+                auto elapsed = fs::now() - loadingBegan;
+                if (elapsed >= 1000)
+                    loadingStats.addSeconds(static_cast<std::uint32_t>(std::min<LONG64>(elapsed / 1000, 3600)));
+                loadingActive = false;
+            }
+            return loading ? loadingStats.thresholdMs(state->loadingMs) : state->timeoutMs;
+        };
         for (;;) {
             lifetime.budget(30000);
-            DWORD targetWait = WaitForSingleObject(target, 200);
+            HANDLE waits[2] = {crashWait ? crashWait : target.value, target.value};
+            DWORD waitCount = crashWait ? 2u : 1u;
+            DWORD waited = WaitForMultipleObjects(waitCount, waits, FALSE, 200);
+            if (crashWait && waited == WAIT_OBJECT_0) {
+                if ((fs::read(state->crashSequence) & ~1L) && !(fs::read(state->crashSequence) & 1L) &&
+                    !fs::read(state->crashAck)) {
+                    session << "tick=" << fs::now() << " fatal_exception code=0x" << std::hex << state->crashCode
+                            << std::dec << " thread=" << state->crashThread << " address=0x" << std::hex
+                            << state->crashAddress << std::dec << '\n';
+                    session.flush();
+                    collect("fatal-exception");
+                    InterlockedExchange(&state->crashAck, 1);
+                }
+                ResetEvent(crashWait);
+                continue;
+            }
+            DWORD targetWait = crashWait ? (waited == WAIT_OBJECT_0 + 1 ? WAIT_OBJECT_0 : waited) : waited;
             if (targetWait == WAIT_OBJECT_0) {
                 DWORD exitCode = 0;
                 bool exitCodeKnown = GetExitCodeProcess(target, &exitCode) != FALSE;
+                if (fs::read(state->userClose)) session << "user_close=1\n";
                 if (exitCodeKnown)
                     session << "process_exit_code=0x" << std::hex << exitCode << std::dec << '\n';
                 else
@@ -190,10 +226,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                         session.flush();
                     } else {
                         evidence << "Observed process termination, PID=" << state->pid << " runtime=" << state->runtime << '\n';
+                        const char* classification = "zero_exit";
+                        if (!exitCodeKnown) classification = "unknown_exit_status";
+                        else if (fs::read(state->crashAck)) classification = "fatal-exception-captured";
+                        else if (fs::read(state->userClose) && exitCode == 0) classification = "user-close";
+                        else if (exitCode) classification = "nonzero_exit_unclassified";
                         if (exitCodeKnown)
                             evidence << "exit_code=0x" << std::hex << exitCode << std::dec
-                                     << " classification=" << (exitCode ? "nonzero_exit_unclassified" : "zero_exit") << '\n';
-                        else evidence << "exit_code=unavailable classification=unknown_exit_status\n";
+                                     << " classification=" << classification << '\n';
+                        else evidence << "exit_code=unavailable classification=" << classification << '\n';
                         evidence << fs::externalCrashEvidence(gameImage, state, processModules);
                         exceptionJournal.write(evidence);
                         evidence << contextEvidence()
@@ -281,7 +322,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                         SMTO_ABORTIFHUNG | SMTO_BLOCK, 100, &response)) windowPulse = t;
                 main = ui = windowPulse;
             }
-            DWORD timeout = fs::read(state->phase) || currentContext.loading() ? state->loadingMs : state->timeoutMs;
+            DWORD timeout = hangTimeout();
             LONG event = fs::read(state->event);
             LONG64 eventTime = fs::read(state->eventTime);
             if (event != lastEvent || eventTime != lastEventTime) {
@@ -349,10 +390,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             // Re-read context after profiling; a newly opened loading screen must affect this decision.
             if (fs::now() - contextTick >= 500) { currentContext = context.sample(); contextTick = fs::now(); }
             paused = fs::read(state->phase) != 0 || currentContext.loading() || !fs::read(state->ready);
-            timeout = fs::read(state->phase) || currentContext.loading() ? state->loadingMs : state->timeoutMs;
-            frameSelection = frames.current();
-            frame = frameSelection.sample.tick;
-            frameAvailable = frameSelection.source && frameSelection.sample.count >= 10;
+            timeout = hangTimeout();
             GetWindowThreadProcessId(GetForegroundWindow(), &foregroundPID);
             if (fs::read(state->ready) && gate.sample(t, fs::read(state->started), main, ui, timeout, state->startupMs)) {
                 std::string reason = !state->taskMonitoring ? "window-not-responding" : !main || !ui ? "startup-task-silence" :
@@ -392,7 +430,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             }
             if (wasReported && !gate.reported) { session << "tick=" << t << " queues recovered\n"; session.flush(); }
             wasReported = gate.reported;
-            bool frameIncident = frameGate.sample(t, state->frameMonitoring ? frameSelection : fs::FrameSelection{},
+            frameSelection = frames.current();
+            const LONG64 frameDecisionTick = fs::now();
+            bool frameIncident = frameGate.sample(frameDecisionTick,
+                                                  state->frameMonitoring ? frameSelection : fs::FrameSelection{},
                                                   foregroundPID == state->pid, paused, timeout);
             if (!gate.reported && frameIncident) {
                 collect("present-silence-with-task-progress"); lastPoll = fs::now();
