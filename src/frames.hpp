@@ -11,6 +11,7 @@ struct FrameSelection {
     FrameSnapshot sample;
     LONG source = 0; // 2=native provider, 1=ETW, 0=unavailable.
     bool nativeExpired = false; // native was seen but is stale; ETW fallback in use.
+    bool usable = false;        // the sample meets the gate's observation threshold.
 };
 class FrameProviderSelector final {
 public:
@@ -18,6 +19,10 @@ public:
     // forever. After this silence the selector falls back to ETW; native
     // resumes precedence as soon as it publishes again.
     static constexpr LONG64 nativeFreshnessMs = 2000;
+    // The gate needs this many observed frames before it can judge silence.
+    // A fallback below this threshold is not eligible: handing an armed native
+    // gate to it would reset the gate and lose the stall.
+    static constexpr LONG64 minimumFrames = 10;
 
     FrameSelection select(const FrameReadResult& native, const FrameReadResult& etw,
                           bool etwAvailable, LONG64 decisionTick) noexcept {
@@ -33,28 +38,34 @@ public:
             hasEtw_ = true;
         }
         const bool nativeFresh = hasNative_ && decisionTick - nativeSeen_ <= nativeFreshnessMs;
+        // "ETW has ever published" is not the same as "ETW is eligible as a
+        // fallback": a 1-9 frame ETW sample cannot satisfy the gate.
+        const bool etwUsable = etwAvailable && hasEtw_ && etw_.sample.count >= minimumFrames;
+        auto qualified = [](FrameSelection selection) {
+            selection.usable = selection.sample.count >= minimumFrames;
+            return selection;
+        };
         if (native.status == FrameReadStatus::Busy) {
-            if (nativeFresh) return native_;
+            if (nativeFresh) return qualified(native_);
             // A busy first read is unknown, not absent: do not fall back before
             // a native source has ever published.
             if (hasNative_) {
-                if (etwAvailable && hasEtw_) { FrameSelection result = etw_; result.nativeExpired = true; return result; }
-                // ETW is unavailable or has never published usable frames. Keep
-                // the last native sample as stalled evidence instead of
-                // discarding the only frame signal: an unobserved source is not
-                // a healthy one.
-                FrameSelection result = native_; result.nativeExpired = true; return result;
+                if (etwUsable) { FrameSelection result = etw_; result.nativeExpired = true; return qualified(result); }
+                // ETW is unavailable or not eligible. Keep the last native
+                // sample as stalled evidence instead of discarding the only
+                // qualified frame signal.
+                FrameSelection result = native_; result.nativeExpired = true; return qualified(result);
             }
             return {};
         }
-        if (nativeFresh) return native_;
+        if (nativeFresh) return qualified(native_);
         if (hasNative_) {
-            if (etwAvailable && hasEtw_) { FrameSelection result = etw_; result.nativeExpired = true; return result; }
-            FrameSelection result = native_; result.nativeExpired = true; return result;
+            if (etwUsable) { FrameSelection result = etw_; result.nativeExpired = true; return qualified(result); }
+            FrameSelection result = native_; result.nativeExpired = true; return qualified(result);
         }
         if (!etwAvailable) return {};
-        if (etw.status == FrameReadStatus::Busy) return hasEtw_ ? etw_ : FrameSelection{};
-        if (hasEtw_) { FrameSelection result = etw_; return result; }
+        if (etw.status == FrameReadStatus::Busy) return hasEtw_ ? qualified(etw_) : FrameSelection{};
+        if (hasEtw_) return qualified(etw_);
         return {};
     }
 private:
@@ -80,7 +91,8 @@ class FrameGate final {
 public:
     bool sample(LONG64 now, const FrameSelection& selection, bool foreground, bool loading, DWORD timeout) {
         const auto& sample = selection.sample;
-        bool eligible = selection.source && sample.present && sample.count >= 10 && foreground && !loading;
+        bool eligible = selection.source && sample.present &&
+                        sample.count >= FrameProviderSelector::minimumFrames && foreground && !loading;
         if (!eligible) { reset(); return false; }
         if (sample.tick > now) return false;
         if (!active_ || sample.count < lastCount_) {

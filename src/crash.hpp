@@ -48,6 +48,34 @@ inline bool isFatalExceptionCode(DWORD code) noexcept {
         return false;
     }
 }
+// Codes the first-chance journal records: every terminal-classifiable code plus
+// the diagnostic events that are useful before a terminal fault (C++ throws and
+// breakpoints). Noisy benign events (single-step, debug strings) stay out.
+inline bool isJournalExceptionCode(DWORD code) noexcept {
+    if (isFatalExceptionCode(code)) return true;
+    switch (code) {
+    case 0xE06D7363u: // C++ exception
+    case EXCEPTION_BREAKPOINT:
+        return true;
+    default:
+        return false;
+    }
+}
+// Exit classification from observed evidence. "Captured" is reserved for a
+// completed text report or a validated dump; an observed-but-unfinished capture
+// is never labelled captured.
+inline const char* classifyExit(bool exitCodeKnown, DWORD exitCode, LONG crashSequence,
+                                LONG captureState, bool userClose) noexcept {
+    if (!exitCodeKnown) return "unknown_exit_status";
+    if (captureState == 4) return "fatal-exception-captured-with-dump";
+    if (captureState == 3) return "fatal-exception-captured-text-only";
+    if (captureState == 2) return "fatal-exception-capture-incomplete";
+    if (captureState == -1) return "fatal-exception-capture-failed";
+    if ((crashSequence & ~1L) && !(crashSequence & 1L)) return "fatal-exception-observed-not-captured";
+    if (userClose && exitCode == 0) return "user-close";
+    if (exitCode) return "nonzero_exit_unclassified";
+    return "zero_exit";
+}
 // Codes that reach the unhandled filter but are still not a crash record.
 inline bool isIgnoredUnhandledCode(DWORD code) noexcept {
     switch (code) {

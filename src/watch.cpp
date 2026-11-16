@@ -202,16 +202,21 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             session << "capture_started tick=" << fs::now() << " reason=" << reason << " collector_deadline_ms=" << state->captureMs
                     << " (exit 124=deadline; 125=target exited during blocked cleanup)\n";
             session.flush();
+            fs::CaptureResult result;
             try {
                 bool complete = fs::capture(target, state->pid, folder, reason, state, state->writeDump != 0,
-                    contextEvidence() + history.text(), reason == "fatal-exception");
-                session << "tick=" << fs::now() << " incident=" << reason << " collection_complete=" << complete << '\n';
+                    contextEvidence() + history.text(), reason == "fatal-exception", &result);
+                session << "tick=" << fs::now() << " incident=" << reason << " collection_complete=" << complete
+                        << " text_complete=" << result.textComplete << " snapshot_captured=" << result.snapshotCaptured
+                        << " dump_requested=" << result.dumpRequested << " dump_validated=" << result.dumpValidated << '\n';
                 fs::retain(folder, state->maxFreezeReports, state->maxManualReports, state->storageMB, sessionPath);
             } catch (const std::exception& error) {
                 session << "capture failed: " << error.what() << "; earlier report sections preserved\n";
+                result = {};
             }
             session.flush();
             lifetime.budget(30000);
+            return result;
         };
         enum class StopReason { TargetExited, CompanionUnavailable, TargetWaitFailed, UnexpectedWaitResult };
         StopReason stopReason = StopReason::TargetExited;
@@ -238,7 +243,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                             << std::dec << " thread=" << state->crashThread << " address=0x" << std::hex
                             << state->crashAddress << std::dec << '\n';
                     session.flush();
-                    collect("fatal-exception");
+                    InterlockedExchange(&state->crashCaptureState, 2); // capture attempted
+                    auto result = collect("fatal-exception");
+                    LONG captureState = -1;
+                    if (result.textComplete) captureState = result.dumpValidated ? 4 : 3;
+                    InterlockedExchange(&state->crashCaptureState, captureState);
+                    session << "crash_capture_state=" << captureState << " text_complete=" << result.textComplete
+                            << " dump_validated=" << result.dumpValidated << '\n';
+                    session.flush();
                     InterlockedExchange(&state->crashAck, 1);
                 }
                 ResetEvent(crashWait);
@@ -261,18 +273,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                         session.flush();
                     } else {
                         evidence << "Observed process termination, PID=" << state->pid << " runtime=" << state->runtime << '\n';
-                        const char* classification = "zero_exit";
-                        const LONG crashSequence = fs::read(state->crashSequence);
-                        if (!exitCodeKnown) classification = "unknown_exit_status";
-                        else if (fs::read(state->crashAck)) classification = "fatal-exception-captured";
-                        else if ((crashSequence & ~1L) && !(crashSequence & 1L))
-                            classification = "fatal-exception-observed-not-captured";
-                        else if (fs::read(state->userClose) && exitCode == 0) classification = "user-close";
-                        else if (exitCode) classification = "nonzero_exit_unclassified";
+                        const char* classification = fs::classifyExit(exitCodeKnown, exitCode,
+                            fs::read(state->crashSequence), fs::read(state->crashCaptureState),
+                            fs::read(state->userClose) != 0);
                         if (exitCodeKnown)
                             evidence << "exit_code=0x" << std::hex << exitCode << std::dec
                                      << " classification=" << classification << '\n';
                         else evidence << "exit_code=unavailable classification=" << classification << '\n';
+                        evidence << "crash_capture_state=" << fs::read(state->crashCaptureState) << '\n';
                         evidence << fs::externalCrashEvidence(gameImage, state, processModules);
                         exceptionJournal.write(evidence);
                         evidence << contextEvidence()
@@ -430,6 +438,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 progress << "PROGRESS tick=" << t << " normal_count=" << fs::read(state->sequence[0]) << " ui_count=" << fs::read(state->sequence[1])
                     << " present_count=" << fs::read(state->frameCount) << " present_tick=" << frame << " frame_source="
                     << fs::read(state->frameSource) << " frame_source_expired=" << fs::read(state->frameSourceExpired)
+                    << " frame_source_usable=" << fs::read(state->frameSourceUsable)
                     << " ETW_status=" << fs::read(state->frameStatus)
                     << " stage_context_ms=" << contextMs << " stage_profile_ms=" << profileMs
                     << " stage_inventory_ms=" << inventoryMs

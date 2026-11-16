@@ -23,6 +23,13 @@ void handledCppThrow() {
     __try { RaiseException(0xE06D7363u, 0, 0, nullptr); }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+void handledCoverageFaults() {
+    for (DWORD code : {EXCEPTION_IN_PAGE_ERROR, EXCEPTION_FLT_DIVIDE_BY_ZERO,
+                       EXCEPTION_INT_OVERFLOW, EXCEPTION_PRIV_INSTRUCTION}) {
+        __try { RaiseException(code, 0, 0, nullptr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+}
 
 // Child-process terminal fixture: a second, well-behaved crash handler is
 // registered either before or after the journal, and both orders must still
@@ -141,6 +148,53 @@ int wmain(int argc, wchar_t** argv) {
               "provisional breadcrumb records the observed code");
         check(fs::read(shared.faultCount) == 3,
               "handled access violations remain in the exception ring");
+    }
+
+    // The first-chance journal covers every terminal-classifiable code, not a
+    // hand-picked subset, and handled faults never consume the terminal slot.
+    {
+        fs::Shared shared{};
+        fs::ExceptionJournal journal(&shared);
+        check(journal.install(&shared), "journal installs for coverage test");
+        handledCoverageFaults();
+        check(fs::read(shared.faultCount) == 4, "journal records every terminal-classifiable code");
+        check(fs::read(shared.crashSequence) == 0, "handled coverage faults do not consume the terminal slot");
+    }
+
+    // Exit classification must match the evidence, never an optimistic label.
+    check(std::string(fs::classifyExit(true, 0xC0000005, 2, 4, false)) == "fatal-exception-captured-with-dump",
+          "validated dump is labelled captured-with-dump");
+    check(std::string(fs::classifyExit(true, 0xC0000005, 2, 3, false)) == "fatal-exception-captured-text-only",
+          "text-only capture is labelled text-only");
+    check(std::string(fs::classifyExit(true, 0xC0000005, 2, 2, false)) == "fatal-exception-capture-incomplete",
+          "an attempted but unfinished capture is not labelled captured");
+    check(std::string(fs::classifyExit(true, 0xC0000005, 2, -1, false)) == "fatal-exception-capture-failed",
+          "a failed capture is labelled failed");
+    check(std::string(fs::classifyExit(true, 0xC0000005, 2, 0, false)) == "fatal-exception-observed-not-captured",
+          "an observed terminal fault without a capture is labelled not-captured");
+    check(std::string(fs::classifyExit(true, 0, 0, 0, true)) == "user-close", "user close is classified");
+    check(std::string(fs::classifyExit(true, 1, 0, 0, false)) == "nonzero_exit_unclassified",
+          "nonzero exit without evidence is unclassified");
+    check(std::string(fs::classifyExit(false, 0, 0, 0, false)) == "unknown_exit_status",
+          "unknown exit status is explicit");
+
+    // Reinstallation must not chain the unhandled filter to itself.
+    {
+        fs::Shared shared{};
+        {
+            fs::ExceptionJournal first(&shared);
+            check(first.install(&shared), "first journal installs");
+        }
+        fs::ExceptionJournal second(&shared);
+        check(second.install(&shared), "second journal installs after the first is destroyed");
+        EXCEPTION_RECORD record{};
+        record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+        record.ExceptionAddress = reinterpret_cast<void*>(0x1234);
+        CONTEXT context{};
+        EXCEPTION_POINTERS pointers{&record, &context};
+        fs::ExceptionJournal::unhandled(&pointers);
+        check(fs::read(shared.crashSequence) == 2,
+              "reinstalled journal publishes one terminal record without recursion");
     }
 
     // The unhandled filter is the terminal classifier: it publishes once, and a

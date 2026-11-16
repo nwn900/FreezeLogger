@@ -23,10 +23,10 @@ int wmain(int argc, wchar_t** argv) {
     auto shared = std::make_unique<fs::Shared>(); shared->pid = GetCurrentProcessId();
     {
         fs::FrameSignal native, etw;
-        check(etw.publish(900, 905, 2), "ETW frame publication");
+        for (int i = 0; i < 10; ++i) check(etw.publish(900, 905, 2), "ETW frame publication");
         auto etwSample = etw.snapshot();
         check(etwSample.status == fs::FrameReadStatus::Coherent && etwSample.sample.present &&
-              etwSample.sample.count == 1 && etwSample.sample.tick == 900, "coherent ETW frame snapshot");
+              etwSample.sample.count == 10 && etwSample.sample.tick == 900, "coherent ETW frame snapshot");
         fs::FrameProviderSelector selector;
         auto selection = selector.select(native.snapshot(), etwSample, true, 1000);
         check(selection.source == 1 && selection.sample.tick == 900, "ETW fallback selected when native adapter is absent");
@@ -109,6 +109,64 @@ int wmain(int argc, wchar_t** argv) {
         fs::FrameProviderSelector emptySelector;
         check(emptySelector.select({}, {}, false, 5000).source == 0,
               "both sources absent from the start stays unavailable");
+
+        // ETW with an insufficient sample count is not an eligible fallback: an
+        // armed native gate must keep its qualified native evidence.
+        for (LONG etwCount : {1L, 9L}) {
+            fs::FrameSignal qualifiedNative, thinEtw;
+            for (int i = 0; i < 10; ++i) check(qualifiedNative.publish(1000, 1000, 3), "qualified native publication");
+            for (LONG i = 0; i < etwCount; ++i) check(thinEtw.publish(1000, 1000, 2), "thin ETW publication");
+            fs::FrameProviderSelector thinSelector;
+            auto fresh = thinSelector.select(qualifiedNative.snapshot(), thinEtw.snapshot(), true, 1000);
+            check(fresh.source == 2 && fresh.usable, "qualified native wins while fresh");
+            fs::FrameGate thinGate;
+            check(!thinGate.sample(1000, fresh, true, false, 15000), "qualified native gate arms");
+            auto stale = thinSelector.select(qualifiedNative.snapshot(), thinEtw.snapshot(), true, 3001);
+            check(stale.source == 2 && stale.nativeExpired && stale.usable,
+                  "thin ETW is not an eligible fallback; qualified native evidence is retained");
+            check(!thinGate.sample(3001, stale, true, false, 15000), "thin ETW does not reset the gate");
+            check(thinGate.sample(16001, stale, true, false, 15000), "native stall still reports with thin ETW present");
+        }
+        // A qualified ETW fallback (>=10 frames) is eligible and hands over.
+        {
+            fs::FrameSignal qualifiedNative, qualifiedEtw;
+            for (int i = 0; i < 10; ++i) check(qualifiedNative.publish(1000, 1000, 3), "qualified native publication");
+            for (int i = 0; i < 10; ++i) check(qualifiedEtw.publish(1000, 1000, 2), "qualified ETW publication");
+            fs::FrameProviderSelector qualifiedSelector;
+            auto fresh = qualifiedSelector.select(qualifiedNative.snapshot(), qualifiedEtw.snapshot(), true, 1000);
+            check(fresh.source == 2, "qualified native wins while fresh");
+            auto handoff = qualifiedSelector.select(qualifiedNative.snapshot(), qualifiedEtw.snapshot(), true, 3001);
+            check(handoff.source == 1 && handoff.nativeExpired && handoff.usable,
+                  "qualified ETW is an eligible fallback");
+            fs::FrameGate qualifiedGate;
+            check(!qualifiedGate.sample(1000, fresh, true, false, 15000), "gate arms on native");
+            check(!qualifiedGate.sample(3001, handoff, true, false, 15000), "handover rebases on ETW's own tick");
+            check(qualifiedGate.sample(16001, handoff, true, false, 15000), "both-frozen stall reports after handover");
+        }
+        // ETW Busy with an insufficient count is not eligible either.
+        {
+            fs::FrameSignal qualifiedNative, thinEtw;
+            for (int i = 0; i < 10; ++i) check(qualifiedNative.publish(1000, 1000, 3), "qualified native publication");
+            check(thinEtw.publish(1000, 1000, 2), "thin ETW publication");
+            fs::FrameProviderSelector busyThinSelector;
+            (void)busyThinSelector.select(qualifiedNative.snapshot(), thinEtw.snapshot(), true, 1000);
+            auto busyThin = fs::FrameReadResult{{}, fs::FrameReadStatus::Busy};
+            auto stale = busyThinSelector.select(qualifiedNative.snapshot(), busyThin, true, 3001);
+            check(stale.source == 2 && stale.nativeExpired,
+                  "busy thin ETW does not replace qualified native evidence");
+        }
+        // ETW once qualified then stopped: the last ETW sample stays as evidence.
+        {
+            fs::FrameSignal qualifiedNative, qualifiedEtw;
+            for (int i = 0; i < 10; ++i) check(qualifiedNative.publish(1000, 1000, 3), "qualified native publication");
+            for (int i = 0; i < 10; ++i) check(qualifiedEtw.publish(1000, 1000, 2), "qualified ETW publication");
+            fs::FrameProviderSelector stoppedSelector;
+            (void)stoppedSelector.select(qualifiedNative.snapshot(), qualifiedEtw.snapshot(), true, 1000);
+            auto handoff = stoppedSelector.select(qualifiedNative.snapshot(), qualifiedEtw.snapshot(), true, 3001);
+            check(handoff.source == 1 && handoff.usable, "ETW handoff uses its last qualified sample");
+            auto later = stoppedSelector.select(qualifiedNative.snapshot(), qualifiedEtw.snapshot(), true, 20000);
+            check(later.source == 1 && later.sample.tick == 1000, "stopped ETW keeps its last present time");
+        }
         LONG64 eventTick = 0;
         check(fs::frameTickFromQpc(100000, 200000, 1000000, 10000, eventTick) && eventTick == 9900,
               "ETW presentation timestamp maps from QPC to monotonic milliseconds");

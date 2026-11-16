@@ -46,8 +46,12 @@ public:
             state_ = nullptr;
             return false;
         }
-        if (!previousFilter_)
+        // A separate installed flag: previousFilter_ may legitimately be null,
+        // and re-registering would return our own handler as "previous".
+        if (!filterInstalled_) {
             previousFilter_ = SetUnhandledExceptionFilter(unhandled);
+            filterInstalled_ = true;
+        }
         if (!abortInstalled_) {
             auto previous = std::signal(SIGABRT, abortSignal);
             previousAbort_ = previous == SIG_ERR ? nullptr : previous;
@@ -150,10 +154,10 @@ private:
             return EXCEPTION_CONTINUE_SEARCH;
         const auto& record = *exception->ExceptionRecord;
         DWORD code = record.ExceptionCode;
-        if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_BREAKPOINT &&
-            code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
-            code != EXCEPTION_STACK_OVERFLOW && code != 0xC0000374 && code != 0xE06D7363)
-            return EXCEPTION_CONTINUE_SEARCH;
+        // Same maintained set as terminal classification, plus the diagnostic
+        // events (C++ throws, breakpoints) that are useful before a terminal
+        // fault. Noisy benign events stay out of the bounded ring.
+        if (!isJournalExceptionCode(code)) return EXCEPTION_CONTINUE_SEARCH;
         if (InterlockedCompareExchange(&state_->faultWriting, 1, 0) != 0) {
             InterlockedIncrement(&state_->faultsDropped);
             return EXCEPTION_CONTINUE_SEARCH;
@@ -212,6 +216,7 @@ private:
         state_->crashCode = code;
         state_->crashThread = GetCurrentThreadId();
         state_->crashAddress = reinterpret_cast<DWORD64>(address);
+        state_->crashCaptureState = 1; // observed; the watcher upgrades this
         MemoryBarrier();
         InterlockedExchange(&state_->crashSequence, 2);
         if (state_->crashEvent) SetEvent(reinterpret_cast<HANDLE>(state_->crashEvent));
@@ -242,8 +247,10 @@ public:
         if (active_ && exception && exception->ExceptionRecord &&
             !isIgnoredUnhandledCode(exception->ExceptionRecord->ExceptionCode))
             active_->publishCrash(exception->ExceptionRecord->ExceptionCode, exception->ExceptionRecord->ExceptionAddress);
+        // Never chain to ourselves: a reinstall must not create a recursive
+        // filter chain.
         auto previous = previousFilter_;
-        return previous ? previous(exception) : EXCEPTION_CONTINUE_SEARCH;
+        return previous && previous != unhandled ? previous(exception) : EXCEPTION_CONTINUE_SEARCH;
     }
 
     static void __cdecl abortSignal(int signalNumber) {
@@ -270,6 +277,7 @@ public:
 private:
     inline static ExceptionJournal* active_ = nullptr;
     inline static LPTOP_LEVEL_EXCEPTION_FILTER previousFilter_ = nullptr;
+    inline static bool filterInstalled_ = false;
     inline static void (__cdecl* previousAbort_)(int) = nullptr;
     inline static bool abortInstalled_ = false;
     struct CppThrowRecord {

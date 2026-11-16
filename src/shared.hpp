@@ -148,7 +148,7 @@ struct alignas(8) Shared {
     Fault faults[faultCapacity];
     volatile LONG eventWriting = 0, eventsDropped = 0;
     volatile LONG64 eventCount = 0, frameTick = 0, frameCount = 0;
-    volatile LONG frameSource = 0, frameStatus = 0, frameThread = 0, frameSourceExpired = 0;
+    volatile LONG frameSource = 0, frameStatus = 0, frameThread = 0, frameSourceExpired = 0, frameSourceUsable = 0;
     FrameSignal nativeFrames, etwFrames;
     EventSlot events[128];
     // One live crash incident. Sequence 0 = none, 1 = writing, 2 = published.
@@ -156,6 +156,10 @@ struct alignas(8) Shared {
     DWORD crashCapture = 1, crashCode = 0, crashThread = 0;
     DWORD64 crashAddress = 0;
     ULONG_PTR crashEvent = 0;
+    // Terminal crash capture state: 0 = none, 1 = observed, 2 = capture
+    // attempted, 3 = text report complete, 4 = dump validated, -1 = failed.
+    // "Captured" is reserved for a completed report or validated dump.
+    volatile LONG crashCaptureState = 0;
     // Provisional first-chance observations: fatal-looking codes that SEH may
     // still handle. They never consume the terminal capture slot.
     volatile LONG provisionalWriting = 0, provisionalCount = 0;
@@ -211,9 +215,16 @@ std::filesystem::path reportRoot(bool vr);
 // Test-only injection points for the capture availability checks.
 void setCommitProbeForTest(bool (*probe)());
 void setPssProbeForTest(bool (*probe)());
+// What a capture actually produced. A text-only report is not a dump.
+struct CaptureResult {
+    bool textComplete = false;
+    bool snapshotCaptured = false;
+    bool dumpRequested = false;
+    bool dumpValidated = false;
+};
 bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
              const std::string& reason, Shared* state, bool dump, const std::string& history = {},
-             bool quick = false);
+             bool quick = false, CaptureResult* result = nullptr);
 void retain(const std::filesystem::path& folder, unsigned freezeLimit, unsigned manualLimit, unsigned storageMB = 0,
             const std::filesystem::path& protectedFile = {});
 std::string eventHistory(Shared* state, LONG64 after = 0);

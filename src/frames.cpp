@@ -117,6 +117,7 @@ FrameSelection FrameObserver::current() noexcept {
     auto selected = selector.select(native, etw, read(state->frameStatus) == ERROR_SUCCESS, now());
     InterlockedExchange(&state->frameSource, selected.source);
     InterlockedExchange(&state->frameSourceExpired, selected.nativeExpired ? 1 : 0);
+    InterlockedExchange(&state->frameSourceUsable, selected.usable ? 1 : 0);
     InterlockedExchange(&state->frameThread, static_cast<LONG>(selected.sample.thread));
     InterlockedExchange64(&state->frameTick, selected.sample.tick);
     InterlockedExchange64(&state->frameCount, selected.sample.count);

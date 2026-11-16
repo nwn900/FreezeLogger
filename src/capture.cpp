@@ -520,7 +520,9 @@ std::string profile(HANDLE target, bool stacks, Shared* state, bool reset) {
     return out.str();
 }
 bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
-             const std::string& reason, Shared* state, bool dump, const std::string& history, bool quick) {
+             const std::string& reason, Shared* state, bool dump, const std::string& history, bool quick,
+             CaptureResult* result) {
+    if (result) *result = {};
     ExceptionJournal exceptionJournal(state);
     const auto gameImage = processImage(target);
     SYSTEMTIME utc{}; GetSystemTime(&utc);
@@ -564,7 +566,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     exceptionJournal.write(log);
     log << eventHistory(state) << history;
     if (state) log << "frame_source=" << read(state->frameSource) << " frame_source_expired=" << read(state->frameSourceExpired)
-        << " frame_status=" << read(state->frameStatus)
+        << " frame_source_usable=" << read(state->frameSourceUsable) << " frame_status=" << read(state->frameStatus)
         << " present_count=" << read(state->frameCount) << " present_tick=" << read(state->frameTick)
         << " present_thread=" << read(state->frameThread) << '\n';
     log.flush();
@@ -667,6 +669,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
             success = false; dumpError = GetLastError(); validation = "rename failed";
         }
         if (!success && createdFile) { std::error_code ignored; std::filesystem::remove(partial, ignored); }
+        if (result) result->dumpValidated = success;
         log << "minidump=" << (success ? diagnosticPath(dumpPath.filename()) : "FAILED")
             << " error=" << dumpError << " structural_validation=" << validation << '\n';
         if (!success && writeWerFallbackHint(folder, gameImage)) log << "wer_fallback_hint=written\n";
@@ -922,6 +925,11 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     for (const auto& [path, m] : identities)
         log << diagnosticPath(m.path) << " version=" << version(m.path) << " disk_sha256=" << sha256(m.path) << '\n';
     log << "\ncollection complete\n";
+    if (result) {
+        result->snapshotCaptured = sampled;
+        result->dumpRequested = dump;
+        result->textComplete = sampled && log.good();
+    }
     return sampled && log.good();
 }
 }
