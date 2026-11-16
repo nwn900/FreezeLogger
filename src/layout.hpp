@@ -12,6 +12,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string_view>
 
 namespace fs {
@@ -36,7 +37,7 @@ struct EngineLayout {
     std::uint32_t menuNameOffset;       // entry -> name
     std::uint32_t menuInstanceOffset;   // entry -> menu instance
     std::uint32_t menuNextOffset;       // entry -> chain link
-    const char* expectedSha256;       // informational only; never a gate
+    const char* expectedSha256;       // built-in rows: qualification fingerprint
     const char* evidence;             // how this row was derived
 };
 
@@ -57,6 +58,21 @@ inline constexpr EngineLayout layouts[] = {
       "1.11.221: player global from the parentCell/FormID chain; UI singleton via RTTI .?AVUI@@ -> vtable 0x27159E8; stack +0x190 confirmed, table +0x1B0 and entry shape inferred from the member constructors" },
 };
 
+// The player half needs the global plus the three offsets the decoder reads
+// before it can produce a cell sample.
+inline bool hasPlayer(const EngineLayout& layout) noexcept {
+    return layout.playerRva && layout.playerCellOffset && layout.cellFormIdOffset && layout.cellTypeOffset;
+}
+
+// The menu half needs the global, both container offsets and a usable entry
+// shape. A row that knows the addresses but not the shapes stays unavailable.
+inline bool hasMenus(const EngineLayout& layout) noexcept {
+    return layout.uiRva && layout.uiStackOffset && layout.uiTableOffset &&
+           layout.uiTableEntriesOffset && layout.menuStride &&
+           layout.menuNameOffset != 0xFFFFFFFF && layout.menuInstanceOffset != 0xFFFFFFFF &&
+           layout.menuNextOffset != 0xFFFFFFFF;
+}
+
 // Runtime overrides let a derived row be added without a rebuild. The file is
 // optional and every row still goes through the same structural validation, so
 // a wrong row fails closed instead of reading a guessed address.
@@ -72,6 +88,20 @@ struct LayoutOverrides {
     }
 };
 
+// Diagnostics for one parse. The collector logs these; a rejected row never
+// replaces a built-in row and never crashes the collector.
+struct LayoutParseReport {
+    std::size_t accepted = 0, rejected = 0, invalidValues = 0, unknownKeys = 0, duplicateSections = 0;
+    char firstError[96]{};
+    void note(const char* message) noexcept {
+        ++rejected;
+        if (firstError[0]) return;
+        std::size_t i = 0;
+        for (; message[i] && i + 1 < sizeof(firstError); ++i) firstError[i] = message[i];
+        firstError[i] = 0;
+    }
+};
+
 namespace detail {
 inline bool parseHex(std::string_view text, std::uint64_t& value) noexcept {
     while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
@@ -84,6 +114,8 @@ inline bool parseHex(std::string_view text, std::uint64_t& value) noexcept {
             : c >= 'a' && c <= 'f' ? static_cast<unsigned>(c - 'a' + 10)
             : c >= 'A' && c <= 'F' ? static_cast<unsigned>(c - 'A' + 10) : 256u;
         if (digit > 15) return false;
+        // Reject values that would wrap instead of silently truncating them.
+        if (result > ((std::numeric_limits<std::uint64_t>::max)() - digit) / 16) return false;
         result = result * 16 + digit;
     }
     value = result;
@@ -97,8 +129,11 @@ inline std::string_view trim(std::string_view text) noexcept {
 }
 
 // Parses [Layout.<runtime-hex>] sections. Unknown keys are ignored so a newer
-// file still loads on an older build. Returns the number of rows accepted.
-inline std::size_t parseLayoutOverrides(std::string_view text, LayoutOverrides& out) noexcept {
+// file still loads on an older build, but they are counted. Invalid values,
+// duplicate sections and rows that cannot decode anything are rejected and
+// reported; a rejected row never shadows a built-in row for the same runtime.
+inline std::size_t parseLayoutOverrides(std::string_view text, LayoutOverrides& out,
+                                        LayoutParseReport* report = nullptr) noexcept {
     out.count = 0;
     EngineLayout* current = nullptr;
     while (!text.empty()) {
@@ -109,13 +144,29 @@ inline std::size_t parseLayoutOverrides(std::string_view text, LayoutOverrides& 
         if (line.front() == '[') {
             current = nullptr;
             auto close = line.find(']');
-            if (close == std::string_view::npos) continue;
+            if (close == std::string_view::npos) {
+                if (report) report->note("unterminated section header");
+                continue;
+            }
             auto name = line.substr(1, close - 1);
             constexpr std::string_view prefix = "Layout.";
             if (name.size() <= prefix.size() || name.substr(0, prefix.size()) != prefix) continue;
             std::uint64_t runtime = 0;
-            if (!detail::parseHex(name.substr(prefix.size()), runtime) || !runtime) continue;
-            if (out.count >= LayoutOverrides::capacity) continue;
+            if (!detail::parseHex(name.substr(prefix.size()), runtime) || !runtime || runtime > 0xFFFFFFFFull) {
+                if (report) report->note("invalid runtime key");
+                continue;
+            }
+            bool duplicate = false;
+            for (std::size_t i = 0; i < out.count; ++i)
+                if (out.rows[i].runtime == runtime) duplicate = true;
+            if (duplicate) {
+                if (report) { ++report->duplicateSections; report->note("duplicate runtime section"); }
+                continue;
+            }
+            if (out.count >= LayoutOverrides::capacity) {
+                if (report) report->note("override capacity exceeded");
+                continue;
+            }
             current = &out.rows[out.count];
             *current = EngineLayout{};
             current->runtime = static_cast<std::uint32_t>(runtime);
@@ -125,43 +176,63 @@ inline std::size_t parseLayoutOverrides(std::string_view text, LayoutOverrides& 
         }
         if (!current) continue;
         auto equals = line.find('=');
-        if (equals == std::string_view::npos) continue;
+        if (equals == std::string_view::npos) {
+            if (report) report->note("malformed entry");
+            continue;
+        }
         auto key = detail::trim(line.substr(0, equals));
         std::uint64_t value = 0;
-        if (!detail::parseHex(line.substr(equals + 1), value)) continue;
-        auto field = [&](std::string_view name, std::uint32_t& target) {
-            if (key == name) { target = static_cast<std::uint32_t>(value); return true; }
-            return false;
+        if (!detail::parseHex(line.substr(equals + 1), value)) {
+            if (report) { ++report->invalidValues; report->note("invalid or overflowing hex value"); }
+            continue;
+        }
+        auto field = [&](std::string_view name, std::uint32_t& target, std::uint32_t maximum) {
+            if (key != name) return false;
+            if (value > maximum) {
+                if (report) { ++report->invalidValues; report->note("value exceeds field width"); }
+                return true;
+            }
+            target = static_cast<std::uint32_t>(value);
+            return true;
         };
-        auto wide = [&](std::string_view name, std::uint64_t& target) {
-            if (key == name) { target = value; return true; }
-            return false;
+        auto wide = [&](std::string_view name, std::uint64_t& target, std::uint64_t maximum) {
+            if (key != name) return false;
+            if (value > maximum) {
+                if (report) { ++report->invalidValues; report->note("value exceeds field width"); }
+                return true;
+            }
+            target = value;
+            return true;
         };
-        if (wide("PlayerRva", current->playerRva)) continue;
-        if (wide("UiRva", current->uiRva)) continue;
-        if (field("PlayerCellOffset", current->playerCellOffset)) continue;
-        if (field("CellFormIdOffset", current->cellFormIdOffset)) continue;
-        if (field("CellTypeOffset", current->cellTypeOffset)) continue;
-        if (field("CellNameOffset", current->cellNameOffset)) continue;
-        if (field("CellSourceOffset", current->cellSourceOffset)) continue;
-        if (field("UiStackOffset", current->uiStackOffset)) continue;
-        if (field("UiTableOffset", current->uiTableOffset)) continue;
-        if (field("UiTableEntriesOffset", current->uiTableEntriesOffset)) continue;
-        if (field("UiTableSizeOffset", current->uiTableSizeOffset)) continue;
-        if (field("MenuStride", current->menuStride)) continue;
-        if (field("MenuNameOffset", current->menuNameOffset)) continue;
-        if (field("MenuInstanceOffset", current->menuInstanceOffset)) continue;
-        if (field("MenuNextOffset", current->menuNextOffset)) continue;
+        constexpr std::uint32_t offsetLimit = 0x1000;   // plausible object displacement
+        constexpr std::uint64_t rvaLimit = 0x7FFFFFFFull; // 32-bit image RVA
+        if (wide("PlayerRva", current->playerRva, rvaLimit)) continue;
+        if (wide("UiRva", current->uiRva, rvaLimit)) continue;
+        if (field("PlayerCellOffset", current->playerCellOffset, offsetLimit)) continue;
+        if (field("CellFormIdOffset", current->cellFormIdOffset, offsetLimit)) continue;
+        if (field("CellTypeOffset", current->cellTypeOffset, offsetLimit)) continue;
+        if (field("CellNameOffset", current->cellNameOffset, offsetLimit)) continue;
+        if (field("CellSourceOffset", current->cellSourceOffset, offsetLimit)) continue;
+        if (field("UiStackOffset", current->uiStackOffset, offsetLimit)) continue;
+        if (field("UiTableOffset", current->uiTableOffset, offsetLimit)) continue;
+        if (field("UiTableEntriesOffset", current->uiTableEntriesOffset, offsetLimit)) continue;
+        if (field("UiTableSizeOffset", current->uiTableSizeOffset, offsetLimit)) continue;
+        if (field("MenuStride", current->menuStride, 0x100)) continue;
+        if (field("MenuNameOffset", current->menuNameOffset, offsetLimit)) continue;
+        if (field("MenuInstanceOffset", current->menuInstanceOffset, offsetLimit)) continue;
+        if (field("MenuNextOffset", current->menuNextOffset, offsetLimit)) continue;
+        if (report) ++report->unknownKeys;
     }
-    // Drop sections that carried no usable field. An empty override must not
-    // shadow a built-in row for the same runtime.
+    // Drop sections that cannot decode either half. An incomplete override must
+    // not shadow a built-in row for the same runtime.
     std::size_t kept = 0;
     for (std::size_t i = 0; i < out.count; ++i) {
         const auto& row = out.rows[i];
-        if (row.playerRva || row.uiRva || row.playerCellOffset || row.uiStackOffset || row.uiTableOffset)
-            out.rows[kept++] = row;
+        if (hasPlayer(row) || hasMenus(row)) out.rows[kept++] = row;
+        else if (report) report->note("override row cannot decode either half");
     }
     out.count = kept;
+    if (report) report->accepted = kept;
     return out.count;
 }
 
@@ -171,19 +242,5 @@ inline const EngineLayout* resolveLayout(std::uint32_t runtime, const LayoutOver
     for (const auto& layout : layouts)
         if (layout.runtime == runtime) return &layout;
     return nullptr;
-}
-
-// The player half needs the global plus the three offsets the decoder reads
-// before it can produce a cell sample.
-inline bool hasPlayer(const EngineLayout& layout) noexcept {
-    return layout.playerRva && layout.playerCellOffset && layout.cellFormIdOffset && layout.cellTypeOffset;
-}
-
-// The menu half needs the global, both container offsets and a usable entry
-// shape. A row that knows the addresses but not the shapes stays unavailable.
-inline bool hasMenus(const EngineLayout& layout) noexcept {
-    return layout.uiRva && layout.uiStackOffset && layout.uiTableOffset &&
-           layout.uiTableEntriesOffset && layout.menuStride && layout.menuNameOffset != 0xFFFFFFFF &&
-           layout.menuInstanceOffset != 0xFFFFFFFF && layout.menuNextOffset != 0xFFFFFFFF;
 }
 } // namespace fs

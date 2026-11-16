@@ -64,6 +64,53 @@ int main() {
           "empty override is dropped so it cannot shadow a built-in row");
     check(fs::resolveLayout(0x010A0A30, &hollow) == modern, "built-in row survives an empty override");
 
+    // Invalid values are rejected instead of wrapping or truncating silently.
+    fs::LayoutOverrides overflow;
+    fs::LayoutParseReport overflowReport;
+    check(fs::parseLayoutOverrides("[Layout.010C0000]\nPlayerRva=0x10000000000000000\n", overflow, &overflowReport) == 0 &&
+          overflowReport.invalidValues == 1 && overflowReport.firstError[0],
+          "over-64-bit hex value is rejected with a diagnostic");
+    fs::LayoutOverrides wide;
+    fs::LayoutParseReport wideReport;
+    check(fs::parseLayoutOverrides("[Layout.010C0000]\nPlayerCellOffset=0x1000000B8\n", wide, &wideReport) == 0 &&
+          wideReport.invalidValues == 1,
+          "over-32-bit offset is rejected instead of truncating to 0xB8");
+    fs::LayoutOverrides stride;
+    fs::LayoutParseReport strideReport;
+    check(fs::parseLayoutOverrides("[Layout.010C0000]\nMenuStride=0x400\n", stride, &strideReport) == 0 &&
+          strideReport.invalidValues == 1,
+          "out-of-range menu stride is rejected");
+
+    // A partial override cannot shadow a working built-in row.
+    fs::LayoutOverrides partialOverride;
+    fs::LayoutParseReport partialReport;
+    check(fs::parseLayoutOverrides("[Layout.010A0A30]\nPlayerRva=0x1111\n", partialOverride, &partialReport) == 0 &&
+          partialReport.rejected == 1,
+          "partial override that cannot decode either half is rejected");
+    check(fs::resolveLayout(0x010A0A30, &partialOverride) == modern,
+          "rejected partial override leaves the built-in row active");
+
+    // Duplicate sections are rejected and counted.
+    fs::LayoutOverrides duplicate;
+    fs::LayoutParseReport duplicateReport;
+    check(fs::parseLayoutOverrides(
+              "[Layout.010C0000]\nPlayerRva=0x1111\nUiRva=0x2222\nPlayerCellOffset=0xB8\n"
+              "CellFormIdOffset=0x14\nCellTypeOffset=0x1A\n"
+              "[Layout.010C0000]\nPlayerRva=0x3333\nUiRva=0x4444\nPlayerCellOffset=0xB8\n"
+              "CellFormIdOffset=0x14\nCellTypeOffset=0x1A\n",
+              duplicate, &duplicateReport) == 1 &&
+          duplicateReport.duplicateSections == 1 && duplicate.rows[0].playerRva == 0x1111,
+          "duplicate runtime section is rejected and the first row is kept");
+
+    // Unknown keys stay forward compatible but are counted.
+    fs::LayoutOverrides unknown;
+    fs::LayoutParseReport unknownReport;
+    check(fs::parseLayoutOverrides(
+              "[Layout.010C0000]\nPlayerRva=0x1111\nUiRva=0x2222\nPlayerCellOffset=0xB8\n"
+              "CellFormIdOffset=0x14\nCellTypeOffset=0x1A\nFutureKey=0x1\n",
+              unknown, &unknownReport) == 1 && unknownReport.unknownKeys == 1,
+          "unknown keys are ignored but counted");
+
     HMODULE image = GetModuleHandleW(nullptr); MODULEINFO info{};
     check(GetModuleInformation(GetCurrentProcess(), image, &info, sizeof(info)) != 0, "fixture image");
     auto base = reinterpret_cast<ULONG64>(image);

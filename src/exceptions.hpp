@@ -183,11 +183,18 @@ private:
         InterlockedExchange64(&state_->faultCount, ordinal);
         InterlockedExchange(&state_->faultWriting, 0);
         if (code == 0xE06D7363u) {
-            keptCppThread_ = GetCurrentThreadId();
-            keptCppTick_ = slot.data.tick;
-            keptCppAddress_ = slot.data.ip;
+            // Coherent, race-free publication of the last handled C++ throw.
+            InterlockedIncrement64(&cppThrow_.generation);
+            InterlockedExchange64(&cppThrow_.tick, slot.data.tick);
+            InterlockedExchange64(&cppThrow_.address, slot.data.ip);
+            InterlockedExchange(&cppThrow_.thread, static_cast<LONG>(GetCurrentThreadId()));
+            MemoryBarrier();
+            InterlockedIncrement64(&cppThrow_.generation);
         } else if (isFatalExceptionCode(code)) {
-            publishCrash(code, record.ExceptionAddress);
+            // First chance only: SEH may still handle this. Breadcrumb it as a
+            // provisional observation; the terminal slot is consumed only by the
+            // unhandled filter or the abort handler.
+            publishProvisional(code, record.ExceptionAddress);
         }
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -204,9 +211,28 @@ private:
         return true;
     }
 
+    // Bounded provisional breadcrumb for a fatal-looking first-chance code that
+    // SEH may still handle. Never consumes the one-shot terminal capture slot.
+    void publishProvisional(DWORD code, const void* address) noexcept {
+        if (!state_) return;
+        if (InterlockedCompareExchange(&state_->provisionalWriting, 1, 0) != 0) return;
+        InterlockedIncrement64(&state_->provisionalGeneration);
+        state_->provisionalCode = code;
+        state_->provisionalThread = GetCurrentThreadId();
+        state_->provisionalAddress = reinterpret_cast<DWORD64>(address);
+        state_->provisionalTick = now();
+        MemoryBarrier();
+        InterlockedIncrement64(&state_->provisionalGeneration);
+        InterlockedExchange(&state_->provisionalWriting, 0);
+        InterlockedIncrement(&state_->provisionalCount);
+    }
+
+public:
+    // Terminal classification: the OS calls this only when no handler claimed
+    // the exception, so any non-ignored code here is genuinely terminal. Public
+    // so the regression tests can exercise the classification without dying.
     static LONG WINAPI unhandled(EXCEPTION_POINTERS* exception) {
         if (active_ && exception && exception->ExceptionRecord &&
-            !isFatalExceptionCode(exception->ExceptionRecord->ExceptionCode) &&
             !isIgnoredUnhandledCode(exception->ExceptionRecord->ExceptionCode))
             active_->publishCrash(exception->ExceptionRecord->ExceptionCode, exception->ExceptionRecord->ExceptionAddress);
         auto previous = previousFilter_;
@@ -214,20 +240,38 @@ private:
     }
 
     static void __cdecl abortSignal(int signalNumber) {
-        if (active_ && keptCppThread_ == GetCurrentThreadId() && keptCppTick_ &&
-            now() - keptCppTick_ <= 500)
-            active_->publishCrash(0xE06D7363u, reinterpret_cast<void*>(keptCppAddress_));
+        if (active_) {
+            // One coherent observation: generation, tick, address and thread are
+            // read as a unit, and the abort must be on the throwing thread and
+            // recent. A handled throw on another thread can never be combined.
+            LONG64 before = InterlockedCompareExchange64(&cppThrow_.generation, 0, 0);
+            if (!(before & 1)) {
+                LONG64 tick = InterlockedCompareExchange64(&cppThrow_.tick, 0, 0);
+                LONG64 address = InterlockedCompareExchange64(&cppThrow_.address, 0, 0);
+                LONG thread = InterlockedCompareExchange(&cppThrow_.thread, 0, 0);
+                MemoryBarrier();
+                LONG64 after = InterlockedCompareExchange64(&cppThrow_.generation, 0, 0);
+                if (before == after && !(after & 1) && thread == static_cast<LONG>(GetCurrentThreadId()) &&
+                    tick && now() - tick <= 500)
+                    active_->publishCrash(0xE06D7363u, reinterpret_cast<void*>(address));
+            }
+        }
         auto previous = previousAbort_;
         if (previous && previous != SIG_DFL && previous != SIG_IGN) previous(signalNumber);
     }
 
+private:
     inline static ExceptionJournal* active_ = nullptr;
     inline static LPTOP_LEVEL_EXCEPTION_FILTER previousFilter_ = nullptr;
     inline static void (__cdecl* previousAbort_)(int) = nullptr;
     inline static bool abortInstalled_ = false;
-    inline static DWORD keptCppThread_ = 0;
-    inline static LONG64 keptCppTick_ = 0;
-    inline static DWORD64 keptCppAddress_ = 0;
+    struct CppThrowRecord {
+        alignas(8) volatile LONG64 generation = 0; // even = stable
+        volatile LONG64 tick = 0;
+        volatile LONG64 address = 0;
+        volatile LONG thread = 0;
+    };
+    inline static CppThrowRecord cppThrow_{};
     Shared* state_ = nullptr;
     PVOID handler_ = nullptr;
 };

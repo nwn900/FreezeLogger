@@ -28,6 +28,36 @@ def required(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+# Environment-dependent skips that are documented and acceptable on a clean
+# host. A skipped mandatory test is not a pass: every entry here is reported in
+# the release receipt as "not qualified on this machine".
+SKIP_POLICY = {
+    "real-dxgi-etw": "DXGI real-time ETW session unavailable on this host",
+    "layout-rows": "no installed Fallout 4 executable matched a shipped layout row",
+}
+
+
+def classify_skips(skipped: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split receipt skips into documented environment skips and failures."""
+    accepted, rejected = [], []
+    for entry in skipped:
+        reason = SKIP_POLICY.get(entry["test"])
+        if reason is None:
+            rejected.append(entry)
+        else:
+            accepted.append({**entry, "policy": reason})
+    return accepted, rejected
+
+
+def qualification(accepted_skips: list[dict]) -> dict:
+    """Report which environment-dependent checks did not run on this host."""
+    names = {entry["test"] for entry in accepted_skips}
+    return {
+        "runtime_layout_qualified": "layout-rows" not in names,
+        "etw_available": "real-dxgi-etw" not in names,
+    }
+
+
 def build_artifact(build: Path, name: str, config: str) -> Path:
     candidates = [build / name, build / config / name]
     for candidate in candidates:
@@ -98,16 +128,22 @@ def main() -> int:
     failed = [test.attrib.get("name", "unnamed") for test in tests
               if test.find("failure") is not None or test.find("error") is not None]
     required(not failed, f"test failures in receipt: {failed}")
+    names = [test.attrib.get("name", "") for test in tests]
+    required(len(names) == len(set(names)), "duplicate test names in receipt")
     skipped = [{
         "test": test.attrib["name"],
         "evidence": test.findtext("system-out", "").strip() or
                     test.find("skipped").attrib.get("message", ""),
     } for test in tests if test.find("skipped") is not None]
-    required(all(entry["test"] == "real-dxgi-etw" for entry in skipped),
-             "only real-dxgi-etw may be skipped")
+    accepted_skips, rejected_skips = classify_skips(skipped)
+    required(not rejected_skips,
+             f"undocumented skipped tests: {[entry['test'] for entry in rejected_skips]}")
 
     dll = build_artifact(build, "FreezeSentryF4.dll", args.config)
     watch = build_artifact(build, "FreezeSentryF4Watch.exe", args.config)
+    newest_output = max(dll.stat().st_mtime, watch.stat().st_mtime)
+    required(report.stat().st_mtime >= newest_output - 1,
+             f"stale CTest receipt: {report} predates the build outputs")
     required(not stage.exists(), f"refusing to replace existing package stage: {stage}")
     required(stage.is_relative_to(ROOT / "build"), "package stage must stay under the repository build directory")
     generated_outputs = []
@@ -149,7 +185,7 @@ def main() -> int:
 
         sources = [ROOT / name for name in (".gitignore", "CMakeLists.txt", "README.md", "LICENSE")]
         private_work = ROOT / "docs" / "agent-work"
-        for directory in ("src", "tests", "docs", "dist", "scripts", "fuzz"):
+        for directory in ("src", "tests", "docs", "dist", "scripts", "fuzz", "tools"):
             sources.extend(
                 path for path in (ROOT / directory).rglob("*")
                 if path.is_file() and "__pycache__" not in path.parts
@@ -157,6 +193,9 @@ def main() -> int:
             )
         source_files = sorted(set(sources))
         required(all(path.is_file() for path in source_files), "source archive input is missing")
+        tools_files = {path.relative_to(ROOT).as_posix() for path in (ROOT / "tools").rglob("*") if path.is_file()}
+        required(tools_files <= {path.relative_to(ROOT).as_posix() for path in source_files},
+                 "source archive omits repository tools")
         with zipfile.ZipFile(source, "x", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
             for path in source_files:
                 archive.write(path, path.relative_to(ROOT).as_posix())
@@ -191,7 +230,8 @@ def main() -> int:
             "readiness": "local game-test candidate",
             "tests_registered": len(expected_tests),
             "tests_passed": len(tests) - len(skipped),
-            "tests_skipped": skipped,
+            "tests_skipped": accepted_skips,
+            **qualification(accepted_skips),
             "symbols_mode": args.symbols_mode,
             "game_startup_qualified": False,
             "gameplay_qualified": False,

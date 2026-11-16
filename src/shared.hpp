@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <atomic>
 #include <filesystem>
 #include <ostream>
 #include <string>
@@ -125,10 +126,10 @@ private:
     alignas(8) volatile LONG64 tick_ = 0, receivedTick_ = 0, count_ = 0;
 };
 struct alignas(8) Shared {
-    LONG signature = magic, version = 8;
+    LONG signature = magic, version = 9;
     DWORD pid = 0, runtime = 0, extender = 0;
     DWORD timeoutMs = 15000, loadingMs = 120000, startupMs = 180000, probeMs = 250;
-    DWORD maxReports = 10, writeDump = 1, manualKey = VK_PAUSE;
+    DWORD maxReports = 10, writeDump = 0, manualKey = VK_PAUSE;
     DWORD suppressBackground = 1, foregroundGraceSec = 10;
     DWORD maxFreezeReports = 10, maxManualReports = 10;
     DWORD taskMonitoring = 1;
@@ -147,7 +148,7 @@ struct alignas(8) Shared {
     Fault faults[faultCapacity];
     volatile LONG eventWriting = 0, eventsDropped = 0;
     volatile LONG64 eventCount = 0, frameTick = 0, frameCount = 0;
-    volatile LONG frameSource = 0, frameStatus = 0, frameThread = 0;
+    volatile LONG frameSource = 0, frameStatus = 0, frameThread = 0, frameSourceExpired = 0;
     FrameSignal nativeFrames, etwFrames;
     EventSlot events[128];
     // One live crash incident. Sequence 0 = none, 1 = writing, 2 = published.
@@ -155,10 +156,25 @@ struct alignas(8) Shared {
     DWORD crashCapture = 1, crashCode = 0, crashThread = 0;
     DWORD64 crashAddress = 0;
     ULONG_PTR crashEvent = 0;
+    // Provisional first-chance observations: fatal-looking codes that SEH may
+    // still handle. They never consume the terminal capture slot.
+    volatile LONG provisionalWriting = 0, provisionalCount = 0;
+    volatile LONG64 provisionalGeneration = 0, provisionalTick = 0;
+    DWORD provisionalCode = 0, provisionalThread = 0;
+    DWORD64 provisionalAddress = 0;
 };
 inline LONG64 read(volatile LONG64& value) { return InterlockedCompareExchange64(&value, 0, 0); }
 inline LONG read(volatile LONG& value) { return InterlockedCompareExchange(&value, 0, 0); }
 inline LONG64 now() { return static_cast<LONG64>(GetTickCount64()); }
+// Process-wide ReadProcessMemory accounting for the overhead budget. The
+// collector reports these counters so a heavy modded session can be measured
+// instead of guessed at.
+struct RpmStats {
+    static std::atomic<unsigned long long>& calls() { static std::atomic<unsigned long long> value{0}; return value; }
+    static std::atomic<unsigned long long>& failures() { static std::atomic<unsigned long long> value{0}; return value; }
+    static std::atomic<unsigned long long>& bytes() { static std::atomic<unsigned long long> value{0}; return value; }
+    static void reset() { calls() = 0; failures() = 0; bytes() = 0; }
+};
 inline LONG64 filetime(FILETIME t) { return (static_cast<LONG64>(t.dwHighDateTime) << 32) | t.dwLowDateTime; }
 struct Handle {
     HANDLE value = nullptr;
@@ -184,6 +200,8 @@ struct StallGate {
     void rearm() { reported = false; }
 };
 std::filesystem::path reportRoot(bool vr);
+// Test-only injection point for the capture availability checks.
+void setCommitProbeForTest(bool (*probe)());
 bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
              const std::string& reason, Shared* state, bool dump, const std::string& history = {},
              bool quick = false);

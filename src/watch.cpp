@@ -39,7 +39,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     auto* state = static_cast<fs::Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(fs::Shared)));
     if (!state) return 3;
     struct Unmap { void* p; ~Unmap() { UnmapViewOfFile(p); } } unmap{state};
-    if (state->signature != fs::magic || state->version != 8 || !state->pid ||
+    if (state->signature != fs::magic || state->version != 9 || !state->pid ||
         state->timeoutMs < 2000 || state->timeoutMs > 3600000 ||
         state->loadingMs < 2000 || state->loadingMs > 3600000 ||
         state->startupMs < 2000 || state->startupMs > 3600000 ||
@@ -97,8 +97,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                     std::string text(64 * 1024, '\0');
                     layoutIni.read(text.data(), static_cast<std::streamsize>(text.size()));
                     text.resize(static_cast<std::size_t>(layoutIni.gcount()));
-                    auto accepted = fs::parseLayoutOverrides(text, overrides);
-                    session << "layout_overrides=" << accepted << '\n';
+                    fs::LayoutParseReport layoutReport;
+                    auto accepted = fs::parseLayoutOverrides(text, overrides, &layoutReport);
+                    session << "layout_overrides=" << accepted
+                            << " rejected=" << layoutReport.rejected
+                            << " invalid_values=" << layoutReport.invalidValues
+                            << " unknown_keys=" << layoutReport.unknownKeys
+                            << " duplicate_sections=" << layoutReport.duplicateSections;
+                    if (layoutReport.firstError[0]) session << " first_error=\"" << layoutReport.firstError << '"';
+                    session << '\n';
                     session.flush();
                 }
             }
@@ -114,7 +121,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             std::ofstream preflight(folder / ("preflight-" + std::to_string(state->pid) + ".json"), std::ios::trunc);
             preflight << "{\n"
                       << "  \"tool\": \"FreezeSentryF4 " << fs::toolVersion << "\",\n"
-                      << "  \"shared_version\": 8,\n"
+                      << "  \"shared_version\": 9,\n"
                       << "  \"game_image\": \"" << fs::jsonEscape(fs::diagnosticPath(gameImage)) << "\",\n"
                       << "  \"pid\": " << state->pid << ",\n"
                       << "  \"runtime\": " << state->runtime << ",\n"
@@ -126,6 +133,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                       << "  \"frame_monitoring\": " << state->frameMonitoring << ",\n"
                       << "  \"context_monitoring\": " << state->contextMonitoring << ",\n"
                       << "  \"context_qualification\": \"" << fs::jsonEscape(context.qualification()) << "\",\n"
+                      << "  \"context_enabled\": " << (context.enabled() ? "true" : "false") << ",\n"
+                      << "  \"context_hash\": \"" << context.hashState() << "\",\n"
                       << "  \"suppress_background\": " << state->suppressBackground << ",\n"
                       << "  \"foreground_grace_sec\": " << state->foregroundGraceSec << ",\n"
                       << "  \"max_reports_legacy\": " << state->maxReports << ",\n"
@@ -180,7 +189,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 GetCurrentProcess(), &crashWait, SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, 0))
             crashWait = nullptr;
         bool suppressionLogged = false;
-        LONG lastEvent = -2;
+        LONG lastEvent = -2, lastProvisional = 0;
+        LONG64 contextMs = 0, profileMs = 0, inventoryMs = 0;
         LONG64 lastEventTime = -1, lastPoll = fs::now(), lastManual = 0;
         bool keyWasDown = false, wasReported = false;
         LONG64 windowPulse = 0;
@@ -252,8 +262,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                     } else {
                         evidence << "Observed process termination, PID=" << state->pid << " runtime=" << state->runtime << '\n';
                         const char* classification = "zero_exit";
+                        const LONG crashSequence = fs::read(state->crashSequence);
                         if (!exitCodeKnown) classification = "unknown_exit_status";
                         else if (fs::read(state->crashAck)) classification = "fatal-exception-captured";
+                        else if ((crashSequence & ~1L) && !(crashSequence & 1L))
+                            classification = "fatal-exception-observed-not-captured";
                         else if (fs::read(state->userClose) && exitCode == 0) classification = "user-close";
                         else if (exitCode) classification = "nonzero_exit_unclassified";
                         if (exitCodeKnown)
@@ -272,6 +285,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                         }
                     }
                 }
+                session << "stage_stats context_ms=" << contextMs << " profile_ms=" << profileMs
+                        << " inventory_ms=" << inventoryMs
+                        << " rpm_calls=" << fs::RpmStats::calls().load(std::memory_order_relaxed)
+                        << " rpm_failures=" << fs::RpmStats::failures().load(std::memory_order_relaxed)
+                        << " rpm_bytes=" << fs::RpmStats::bytes().load(std::memory_order_relaxed) << '\n';
+                session.flush();
                 stopReason = StopReason::TargetExited;
                 break;
             }
@@ -292,7 +311,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             auto t = fs::now();
             InterlockedExchange64(&state->monitorPulse, t);
             if (t - lastContextPoll >= 500) {
+                auto contextBegan = fs::now();
                 currentContext = context.sample(); contextTick = t; lastContextPoll = t;
+                contextMs += fs::now() - contextBegan;
                 if (currentContext.cellValid) {
                     lastReadable.cellValid = true; lastReadable.cell = currentContext.cell; lastReadable.cellName = currentContext.cellName;
                     lastReadable.origin = currentContext.origin; lastReadable.files = currentContext.files; lastCellTick = t;
@@ -317,6 +338,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 }
             }
             if (t - inventoryTime >= 10000) {
+                auto inventoryBegan = fs::now();
                 std::array<HMODULE, 2048> modules{}; DWORD needed = 0;
                 if (EnumProcessModulesEx(target, modules.data(), sizeof(modules), &needed, LIST_MODULES_64BIT) &&
                     (needed != previousModuleBytes || modules != previousModules)) {
@@ -338,6 +360,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                     previousModules = modules; previousModuleBytes = needed;
                 }
                 inventoryTime = t;
+                inventoryMs += fs::now() - inventoryBegan;
             }
             LONG64 main = fs::read(state->pulse[0]), ui = fs::read(state->pulse[1]);
             if (!state->taskMonitoring) {
@@ -353,6 +376,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             if (event != lastEvent || eventTime != lastEventTime) {
                 session << "tick=" << eventTime << " F4SE event=" << event << " loading/saving=" << fs::read(state->phase) << '\n';
                 session.flush(); lastEvent = event; lastEventTime = eventTime;
+            }
+            LONG provisional = fs::read(state->provisionalCount);
+            if (provisional != lastProvisional) {
+                session << "tick=" << t << " provisional_fatal_observation code=0x" << std::hex << state->provisionalCode
+                        << std::dec << " thread=" << state->provisionalThread << " address=0x" << std::hex
+                        << state->provisionalAddress << std::dec << " count=" << provisional
+                        << " (first chance; may have been handled; terminal capture not consumed)\n";
+                session.flush();
+                lastProvisional = provisional;
             }
             // System sleep and a paused debugger can suspend the observer too.
             if (t - lastPoll > 5000) {
@@ -394,8 +426,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 std::ostringstream progress;
                 progress << "PROGRESS tick=" << t << " normal_count=" << fs::read(state->sequence[0]) << " ui_count=" << fs::read(state->sequence[1])
                     << " present_count=" << fs::read(state->frameCount) << " present_tick=" << frame << " frame_source="
-                    << fs::read(state->frameSource) << " ETW_status=" << fs::read(state->frameStatus) << '\n';
-                history.add(progress.str() + fs::profile(target, early, state));
+                    << fs::read(state->frameSource) << " frame_source_expired=" << fs::read(state->frameSourceExpired)
+                    << " ETW_status=" << fs::read(state->frameStatus)
+                    << " stage_context_ms=" << contextMs << " stage_profile_ms=" << profileMs
+                    << " stage_inventory_ms=" << inventoryMs
+                    << " rpm_calls=" << fs::RpmStats::calls().load(std::memory_order_relaxed)
+                    << " rpm_failures=" << fs::RpmStats::failures().load(std::memory_order_relaxed)
+                    << " rpm_bytes=" << fs::RpmStats::bytes().load(std::memory_order_relaxed) << '\n';
+                auto profileBegan = fs::now();
+                auto profileText = fs::profile(target, early, state);
+                profileMs += fs::now() - profileBegan;
+                history.add(progress.str() + profileText);
                 lastProfile = fs::now(); if (early) { lastEarly = lastProfile; ++earlyCount; }
                 persistHistory(); lastPoll = fs::now();
             }

@@ -23,10 +23,14 @@ class ContextObserver {
     ULONG64 base = 0;
     DWORD size = 0;
     std::string status;
+    const char* hashState_ = "none";
 public:
     ContextObserver(HANDLE target, DWORD runtime, bool enabled, const LayoutOverrides* overrides = nullptr);
     EngineContext sample() const;
     const std::string& qualification() const { return status; }
+    // "match", "differs", "not-declared" (override row) or "none" (no layout).
+    const char* hashState() const { return hashState_; }
+    bool enabled() const { return base && layout; }
 };
 std::string diskSHA256(const std::filesystem::path& path);
 }

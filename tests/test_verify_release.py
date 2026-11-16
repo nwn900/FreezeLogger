@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import package
 import verify_release
 
 
@@ -153,6 +154,41 @@ class ReleaseVerifierTests(unittest.TestCase):
             "piece4/F4SE/Plugins/FreezeSentryF4Watch.pdb": self.watch_pdb,
         })
         self.assertEqual(self.verify(package), 1)
+
+
+class PackageSkipPolicyTests(unittest.TestCase):
+    def test_layout_only_skip_is_accepted(self):
+        accepted, rejected = package.classify_skips(
+            [{"test": "layout-rows", "evidence": "SKIP: no executable matches a shipped row digest"}])
+        self.assertEqual([entry["test"] for entry in accepted], ["layout-rows"])
+        self.assertEqual(rejected, [])
+        self.assertIn("policy", accepted[0])
+        self.assertFalse(package.qualification(accepted)["runtime_layout_qualified"])
+        self.assertTrue(package.qualification(accepted)["etw_available"])
+
+    def test_combined_etw_and_layout_skip_is_accepted(self):
+        accepted, rejected = package.classify_skips([
+            {"test": "real-dxgi-etw", "evidence": "ETW unavailable"},
+            {"test": "layout-rows", "evidence": "SKIP: no executable matches a shipped row digest"},
+        ])
+        self.assertEqual(len(accepted), 2)
+        self.assertEqual(rejected, [])
+        self.assertEqual(package.qualification(accepted),
+                         {"runtime_layout_qualified": False, "etw_available": False})
+
+    def test_unexpected_skip_is_rejected(self):
+        accepted, rejected = package.classify_skips([{"test": "engine-context", "evidence": "skipped"}])
+        self.assertEqual(accepted, [])
+        self.assertEqual([entry["test"] for entry in rejected], ["engine-context"])
+
+    def test_duplicate_skip_entries_are_still_classified(self):
+        accepted, rejected = package.classify_skips([
+            {"test": "layout-rows", "evidence": "a"},
+            {"test": "layout-rows", "evidence": "b"},
+            {"test": "diagnostics", "evidence": "c"},
+        ])
+        self.assertEqual(len(accepted), 2)
+        self.assertEqual([entry["test"] for entry in rejected], ["diagnostics"])
 
 
 if __name__ == "__main__":

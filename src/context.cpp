@@ -14,9 +14,13 @@ struct Reader {
     DWORD size;
     bool bytes(ULONG64 address, void* output, size_t count) const {
         SIZE_T got = 0;
-        return address >= 0x10000 && address <= 0x00007fffffff0000ULL && count <= 1024 * 1024 &&
+        RpmStats::calls().fetch_add(1, std::memory_order_relaxed);
+        bool ok = address >= 0x10000 && address <= 0x00007fffffff0000ULL && count <= 1024 * 1024 &&
             count <= 0x00007fffffff0000ULL - address &&
             ReadProcessMemory(process, reinterpret_cast<void*>(address), output, count, &got) && got == count;
+        if (ok) RpmStats::bytes().fetch_add(count, std::memory_order_relaxed);
+        else RpmStats::failures().fetch_add(1, std::memory_order_relaxed);
+        return ok;
     }
     template<class T> bool get(ULONG64 address, T& output) const { return bytes(address, &output, sizeof(output)); }
     bool object(ULONG64 address) const {
@@ -216,15 +220,27 @@ ContextObserver::ContextObserver(HANDLE process, DWORD runtime, bool enabled, co
         status = "layout for runtime " + hex(runtime) + " does not match this image's data sections; adapter disabled";
         return;
     }
+    // Built-in rows are qualified by their on-disk fingerprint. A mismatch is
+    // unqualified: the adapter stays disabled rather than reading plausible but
+    // wrong offsets from a different build of the same runtime. Override rows
+    // carry no fingerprint and are structural-only by design.
+    if (layout->expectedSha256 && *layout->expectedSha256) {
+        auto actual = diskSHA256(path.data());
+        if (actual != layout->expectedSha256) {
+            hashState_ = "differs";
+            status = "layout for runtime " + hex(runtime) + " exists but the image hash differs (unqualified); adapter disabled";
+            return;
+        }
+        hashState_ = "match";
+    } else {
+        hashState_ = "not-declared";
+    }
     base = imageBase; size = info.SizeOfImage;
     std::ostringstream qualified;
     qualified << "runtime " << hex(runtime) << " layout enabled; player="
               << (hasPlayer(*layout) ? hex(layout->playerRva) : "unavailable")
-              << " menus=" << (hasMenus(*layout) ? hex(layout->uiRva) : "unavailable");
-    if (layout->expectedSha256 && *layout->expectedSha256) {
-        auto actual = diskSHA256(path.data());
-        qualified << "; image_hash=" << (actual == layout->expectedSha256 ? "match" : "differs(" + actual + ")");
-    }
+              << " menus=" << (hasMenus(*layout) ? hex(layout->uiRva) : "unavailable")
+              << "; image_hash=" << hashState_;
     status = qualified.str();
 }
 EngineContext ContextObserver::sample() const {

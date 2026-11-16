@@ -28,27 +28,55 @@ int wmain(int argc, wchar_t** argv) {
         check(etwSample.status == fs::FrameReadStatus::Coherent && etwSample.sample.present &&
               etwSample.sample.count == 1 && etwSample.sample.tick == 900, "coherent ETW frame snapshot");
         fs::FrameProviderSelector selector;
-        auto selection = selector.select(native.snapshot(), etwSample, true);
+        auto selection = selector.select(native.snapshot(), etwSample, true, 1000);
         check(selection.source == 1 && selection.sample.tick == 900, "ETW fallback selected when native adapter is absent");
-        check(native.publish(1000, 1001, 3), "native frame publication");
-        selection = selector.select(native.snapshot(), etw.snapshot(), true);
+        check(native.publish(1000, 1000, 3), "native frame publication");
+        selection = selector.select(native.snapshot(), etw.snapshot(), true, 1000);
         check(selection.source == 2 && selection.sample.tick == 1000, "native frame source outranks delayed ETW");
+        selection = selector.select(native.snapshot(), etw.snapshot(), true,
+                                    1000 + fs::FrameProviderSelector::nativeFreshnessMs + 1);
+        check(selection.source == 1 && selection.nativeExpired, "stale native source expires and ETW resumes");
+        check(native.publish(5000, 5000, 3), "native frame republication");
+        selection = selector.select(native.snapshot(), etw.snapshot(), true, 5000);
+        check(selection.source == 2 && !selection.nativeExpired, "resumed native source regains precedence");
         auto busy = fs::FrameReadResult{{}, fs::FrameReadStatus::Busy};
         fs::FrameProviderSelector etwBusySelector;
         fs::FrameSignal neverNative;
-        selection = etwBusySelector.select(neverNative.snapshot(), etwSample, true);
+        selection = etwBusySelector.select(neverNative.snapshot(), etwSample, true, 1000);
         check(selection.source == 1, "ETW provider is available before a native source publishes");
-        selection = etwBusySelector.select(neverNative.snapshot(), busy, true);
+        selection = etwBusySelector.select(neverNative.snapshot(), busy, true, 1000);
         check(selection.source == 1 && selection.sample.tick == 900,
               "a busy ETW read retains its last coherent fallback sample");
+        fs::FrameSignal busyNative;
+        check(busyNative.publish(5000, 5000, 3), "busy fixture native publication");
         fs::FrameProviderSelector busySelector;
-        selection = busySelector.select(busy, etwSample, true);
+        selection = busySelector.select(busy, etwSample, true, 5000);
         check(selection.source == 0, "a busy first native publication is not mistaken for absent native telemetry");
-        selection = busySelector.select(native.snapshot(), etw.snapshot(), true);
+        selection = busySelector.select(busyNative.snapshot(), etw.snapshot(), true, 5000);
         check(selection.source == 2, "coherent native publication becomes authoritative");
-        selection = busySelector.select(busy, etw.snapshot(), true);
-        check(selection.source == 2 && selection.sample.tick == 1000,
+        selection = busySelector.select(busy, etw.snapshot(), true, 5000);
+        check(selection.source == 2 && selection.sample.tick == 5000,
               "a busy native read retains its last coherent sample and native authority");
+        selection = busySelector.select(busy, etw.snapshot(), true,
+                                        5000 + fs::FrameProviderSelector::nativeFreshnessMs + 1);
+        check(selection.source == 1 && selection.nativeExpired,
+              "a busy native read after the freshness window falls back to ETW");
+
+        // Both sources genuinely frozen: the handover keeps the last present
+        // time, so the gate still reports a stall instead of a healthy handover.
+        fs::FrameSignal frozenNative, frozenEtw;
+        for (int i = 0; i < 10; ++i) {
+            check(frozenNative.publish(1000, 1000, 3) && frozenEtw.publish(1000, 1000, 2), "frozen fixture publication");
+        }
+        fs::FrameProviderSelector frozenSelector;
+        auto frozen = frozenSelector.select(frozenNative.snapshot(), frozenEtw.snapshot(), true, 1000);
+        check(frozen.source == 2, "frozen fixture starts on native");
+        fs::FrameGate gate;
+        check(!gate.sample(1000, frozen, true, false, 2000), "frozen fixture gate arms");
+        frozen = frozenSelector.select(frozenNative.snapshot(), frozenEtw.snapshot(), true, 4000);
+        check(frozen.source == 1 && frozen.sample.tick == 1000, "frozen native hands over to frozen ETW");
+        check(!gate.sample(4000, frozen, true, false, 2000), "handover rebases without a spurious immediate report");
+        check(gate.sample(4001, frozen, true, false, 2000), "handover to an equally frozen source still reports the stall");
         LONG64 eventTick = 0;
         check(fs::frameTickFromQpc(100000, 200000, 1000000, 10000, eventTick) && eventTick == 9900,
               "ETW presentation timestamp maps from QPC to monotonic milliseconds");

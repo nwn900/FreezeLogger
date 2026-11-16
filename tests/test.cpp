@@ -105,7 +105,10 @@ int wmain(int argc, wchar_t** argv) {
     // This row targets a runtime the fixture never reports, so it exercises the
     // read path without changing which layout the adapter resolves.
     { std::ofstream layout(staging / "FreezeSentryF4.layout.ini");
-      layout << "[Layout.010C0000]\nPlayerRva=0x1111\nUiRva=0x2222\n"; }
+      layout << "[Layout.010C0000]\nPlayerRva=0x1111\nUiRva=0x2222\n"
+                "PlayerCellOffset=0xB8\nCellFormIdOffset=0x14\nCellTypeOffset=0x1A\n"
+                "UiStackOffset=0x190\nUiTableOffset=0x1B0\nUiTableEntriesOffset=0x20\n"
+                "MenuStride=0x28\nMenuNameOffset=0x08\nMenuInstanceOffset=0x10\nMenuNextOffset=0x20\n"; }
     HMODULE plugin = LoadLibraryW(dll.c_str());
     check(plugin != nullptr, "load actual DLL");
     auto* version = reinterpret_cast<fs::Version*>(GetProcAddress(plugin, "F4SEPlugin_Version"));

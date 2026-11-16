@@ -6,6 +6,7 @@
 #include <processsnapshot.h>
 #include <dbghelp.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <shlobj.h>
 #include <bcrypt.h>
 #include <wct.h>
@@ -22,6 +23,8 @@
 #include <mutex>
 
 namespace fs {
+namespace { bool (*commitProbe)() = nullptr; }
+void setCommitProbeForTest(bool (*probe)()) { commitProbe = probe; }
 std::filesystem::path reportRoot(bool vr) {
     PWSTR documents = nullptr;
     auto result = SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &documents);
@@ -33,11 +36,15 @@ std::filesystem::path reportRoot(bool vr) {
 namespace {
 constexpr DWORD64 MIN_COMMIT_BYTES_FOR_VA_CLONE = 2ULL * 1024 * 1024 * 1024; // 2 GiB
 constexpr DWORD CLONE_TERMINATION_WAIT_MS = 5000;
+// Test-only injection point: lets the regression tests force the low-commit and
+// clone-failure paths without exhausting real commit. Declared above so the
+// setter can live in the public namespace.
 // PssFreeSnapshot returns before the clone process fully exits, so a 0 ms
 // liveness check cannot tell a slow reaping from a real leak. Only terminate
 // when the clone survives this grace period.
 constexpr DWORD CLONE_EXIT_GRACE_MS = 500;
 bool commitAvailableForClone() {
+    if (commitProbe) return commitProbe();
     MEMORYSTATUSEX system{}; system.dwLength = sizeof(system);
     if (!GlobalMemoryStatusEx(&system)) return true; // Fail open; the capture attempt reports its own error.
     return system.ullAvailPageFile >= MIN_COMMIT_BYTES_FOR_VA_CLONE;
@@ -227,7 +234,13 @@ std::string waitChains(const std::vector<DWORD>& ids) {
 }
 template<class T> bool remote(HANDLE process, DWORD64 address, T& value) {
     SIZE_T size = 0;
-    return ReadProcessMemory(process, reinterpret_cast<void*>(address), &value, sizeof(value), &size) && size == sizeof(value);
+    RpmStats::calls().fetch_add(1, std::memory_order_relaxed);
+    if (ReadProcessMemory(process, reinterpret_cast<void*>(address), &value, sizeof(value), &size) && size == sizeof(value)) {
+        RpmStats::bytes().fetch_add(size, std::memory_order_relaxed);
+        return true;
+    }
+    RpmStats::failures().fetch_add(1, std::memory_order_relaxed);
+    return false;
 }
 std::string rtti(HANDLE process, DWORD64 address, const std::vector<Module>& modules) {
     DWORD64 table = 0, locator = 0;
@@ -550,7 +563,8 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     log.flush(); // Even snapshot failure or collection interruption leaves incident evidence.
     exceptionJournal.write(log);
     log << eventHistory(state) << history;
-    if (state) log << "frame_source=" << read(state->frameSource) << " frame_status=" << read(state->frameStatus)
+    if (state) log << "frame_source=" << read(state->frameSource) << " frame_source_expired=" << read(state->frameSourceExpired)
+        << " frame_status=" << read(state->frameStatus)
         << " present_count=" << read(state->frameCount) << " present_tick=" << read(state->frameTick)
         << " present_thread=" << read(state->frameThread) << '\n';
     log.flush();
@@ -565,30 +579,69 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     log << "\nSAMPLE " << sample + 1 << '/' << sampleCount << " tick=" << now() << '\n';
     Snapshot snapshot;
     snapshot.log = &log;
-    if (!commitAvailableForClone()) {
-        log << "snapshot_deferred_low_commit; no thread snapshot or minidump available\n";
-        if (writeWerFallbackHint(folder, gameImage)) log << "wer_fallback_hint=written\n";
-        return false;
-    }
-    auto flags = static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_VA_CLONE | PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT);
+    bool cloneMode = commitAvailableForClone();
+    if (!cloneMode) log << "snapshot_clone_deferred_low_commit; attempting thread-only fallback\n";
     auto captureBegan = now();
+    auto flags = cloneMode
+        ? static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_VA_CLONE | PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT)
+        : static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT);
     DWORD error = PssCaptureSnapshot(target, flags, CONTEXT_ALL, &snapshot.value);
+    if (error != ERROR_SUCCESS && cloneMode) {
+        log << "snapshot_error=" << error << " clone_mode=1; attempting thread-only fallback\n";
+        cloneMode = false;
+        captureBegan = now();
+        flags = static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT);
+        error = PssCaptureSnapshot(target, flags, CONTEXT_ALL, &snapshot.value);
+    }
     if (error != ERROR_SUCCESS) {
-        log << "snapshot_error=" << error << "; no thread snapshot or minidump available\n";
+        // Last resort: thread identities and wait reasons without any snapshot.
+        log << "snapshot_error=" << error << " clone_mode=0; using Toolhelp thread inventory\n";
+        log << "capture_method=toolhelp-thread-inventory omitted=contexts,stacks,modules,symbols,minidump\n";
+        MEMORYSTATUSEX systemMemory{}; systemMemory.dwLength = sizeof(systemMemory);
+        if (GlobalMemoryStatusEx(&systemMemory))
+            log << "system_available_physical=" << systemMemory.ullAvailPhys
+                << " system_available_commit=" << systemMemory.ullAvailPageFile << '\n';
+        HANDLE toolhelp = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        unsigned count = 0;
+        if (toolhelp != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 entry{}; entry.dwSize = sizeof(entry);
+            if (Thread32First(toolhelp, &entry)) {
+                do {
+                    if (entry.th32OwnerProcessID != pid) continue;
+                    log << "thread=" << entry.th32ThreadID << " toolhelp_base_priority=" << entry.tpBasePri << '\n';
+                    if (!sample) threadIDs.push_back(entry.th32ThreadID);
+                    ++count;
+                } while (Thread32Next(toolhelp, &entry));
+            }
+            CloseHandle(toolhelp);
+        }
+        log << "thread_count=" << count << " capture_method=toolhelp\n";
+        sampled |= count > 0;
         if (writeWerFallbackHint(folder, gameImage)) log << "wer_fallback_hint=written\n";
-        return false;
+        log.flush();
+        continue;
     }
-    if (!snapshot.trackClone()) {
-        log << "clone_untracked; capture aborted, snapshot released\n";
-        return false;
-    }
-    log << "snapshot_capture_ms=" << now() - captureBegan << " dump_transport=pss-snapshot\n";
+    log << "snapshot_capture_ms=" << now() - captureBegan << " dump_transport="
+        << (cloneMode ? "pss-snapshot" : "pss-thread-only") << '\n';
     PSS_VA_CLONE_INFORMATION clone{};
-    error = PssQuerySnapshot(snapshot.value, PSS_QUERY_VA_CLONE_INFORMATION, &clone, sizeof(clone));
-    if (error != ERROR_SUCCESS || !clone.VaCloneHandle) { log << "clone_query_error=" << error << '\n'; return false; }
-    log << "capture_source=Windows PSS snapshot; game threads are not manually suspended\n";
+    if (cloneMode) {
+        if (!snapshot.trackClone()) {
+            log << "clone_untracked; capture aborted, snapshot released\n";
+            return false;
+        }
+        error = PssQuerySnapshot(snapshot.value, PSS_QUERY_VA_CLONE_INFORMATION, &clone, sizeof(clone));
+        if (error != ERROR_SUCCESS || !clone.VaCloneHandle) { log << "clone_query_error=" << error << '\n'; return false; }
+        log << "capture_source=Windows PSS snapshot; game threads are not manually suspended\n";
+    } else {
+        // No VA clone: read the live target directly. Threads and contexts come
+        // from the thread-only snapshot; stacks, modules and symbols are read
+        // from the running process and are explicitly lower fidelity.
+        clone.VaCloneHandle = target;
+        log << "capture_method=pss-thread-only omitted=va-clone,minidump (low commit or clone failure)\n";
+        log << "capture_source=Windows PSS thread-only snapshot; live memory reads are not an atomic clone\n";
+    }
     log.flush();
-    if (dump && sample == 0) {
+    if (cloneMode && dump && sample == 0) {
         auto dumpPath = folder / (stem.str() + ".dmp");
         auto partial = dumpPath; partial += ".partial";
         Handle file(CreateFileW(partial.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
@@ -611,6 +664,9 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
         log << "minidump=" << (success ? diagnosticPath(dumpPath.filename()) : "FAILED")
             << " error=" << dumpError << " structural_validation=" << validation << '\n';
         if (!success && writeWerFallbackHint(folder, gameImage)) log << "wer_fallback_hint=written\n";
+        log.flush();
+    } else if (dump && sample == 0) {
+        log << "minidump=skipped (thread-only fallback; no VA clone)\n";
         log.flush();
     }
     std::vector<Module> modules;
