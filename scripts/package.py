@@ -69,7 +69,27 @@ def test_inputs(build: Path, config: str) -> list[Path]:
             inputs.extend(path for path in directory.glob("*.dll") if path.is_file())
     inputs.append(ROOT / "CMakeLists.txt")
     inputs.extend(path for path in (ROOT / "tests").rglob("*.py") if path.is_file())
+    for directory in ("src", "fuzz"):
+        inputs.extend(path for path in (ROOT / directory).rglob("*") if path.is_file())
     return inputs
+
+
+def build_configuration(build: Path, config: str) -> None:
+    """Rebuild the chosen configuration so binaries match the current source."""
+    subprocess.run(["cmake", "--build", str(build), "--config", config, "--parallel"], check=True)
+
+
+def source_manifest() -> dict:
+    """Immutable source revision and dirty state for the release receipt."""
+    def git(*arguments: str) -> str:
+        return subprocess.run(["git", *arguments], cwd=ROOT, capture_output=True, text=True,
+                              check=True).stdout.strip()
+    try:
+        commit = git("rev-parse", "HEAD")
+        dirty = git("status", "--porcelain", "--untracked-files=no")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {"commit": "unavailable", "dirty": None, "dirty_paths": []}
+    return {"commit": commit, "dirty": bool(dirty), "dirty_paths": dirty.splitlines()[:20]}
 
 
 def stale_receipt(report: Path, inputs: list[Path]) -> Path | None:
@@ -150,6 +170,11 @@ def main() -> int:
     required(configured_symbols is not None, f"CMake cache has no valid FSF4_SYMBOLS_MODE: {build / 'CMakeCache.txt'}")
     required(configured_symbols.group(1) == args.symbols_mode,
              f"package symbols mode {args.symbols_mode} differs from CMake mode {configured_symbols.group(1)}")
+    generator = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.+)$", cache, re.M)
+
+    # Binaries must be built from the source that is about to be archived: a
+    # source edit after the last build must not ship with stale executables.
+    build_configuration(build, args.config)
 
     inventory = subprocess.run(
         ["ctest", "--test-dir", str(build), "-C", args.config, "--show-only=json-v1"],
@@ -270,6 +295,12 @@ def main() -> int:
         ), encoding="utf-8")
         receipt = {
             "version": VERSION,
+            "source": source_manifest(),
+            "build": {
+                "generator": generator.group(1) if generator else "unknown",
+                "config": args.config,
+                "symbols_mode": args.symbols_mode,
+            },
             "readiness": "local game-test candidate",
             "tests_registered": len(expected_tests),
             "tests_passed": len(tests) - len(skipped),

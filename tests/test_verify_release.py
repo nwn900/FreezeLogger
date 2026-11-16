@@ -245,5 +245,19 @@ class PackageReceiptFreshnessTests(unittest.TestCase):
             self.assertTrue(any(path.suffix == ".py" for path in inputs))
 
 
+class PackageProvenanceTests(unittest.TestCase):
+    def test_source_manifest_reports_commit_and_dirty_state(self):
+        manifest = package.source_manifest()
+        self.assertIn("commit", manifest)
+        self.assertNotEqual(manifest["commit"], "")
+        self.assertIn("dirty", manifest)
+
+    def test_test_inputs_include_cpp_sources_and_headers(self):
+        inputs = package.test_inputs(Path("."), "RelWithDebInfo")
+        names = {path.name for path in inputs}
+        self.assertIn("plugin.cpp", names)
+        self.assertIn("frames.hpp", names)
+
+
 if __name__ == "__main__":
     unittest.main()
