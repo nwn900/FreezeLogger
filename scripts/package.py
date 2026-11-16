@@ -34,6 +34,7 @@ def required(condition: bool, message: str) -> None:
 SKIP_POLICY = {
     "real-dxgi-etw": "DXGI real-time ETW session unavailable on this host",
     "layout-rows": "no installed Fallout 4 executable matched a shipped layout row",
+    "snapshot-cleanup": "self PSS clone unavailable on this host",
 }
 
 
@@ -55,7 +56,42 @@ def qualification(accepted_skips: list[dict]) -> dict:
     return {
         "runtime_layout_qualified": "layout-rows" not in names,
         "etw_available": "real-dxgi-etw" not in names,
+        "pss_clone_qualified": "snapshot-cleanup" not in names,
     }
+
+
+def test_inputs(build: Path, config: str) -> list[Path]:
+    """Every file whose change invalidates a test receipt."""
+    inputs = []
+    for directory in (build, build / config):
+        if directory.is_dir():
+            inputs.extend(path for path in directory.glob("*.exe") if path.is_file())
+            inputs.extend(path for path in directory.glob("*.dll") if path.is_file())
+    inputs.append(ROOT / "CMakeLists.txt")
+    inputs.extend(path for path in (ROOT / "tests").rglob("*.py") if path.is_file())
+    return inputs
+
+
+def stale_receipt(report: Path, inputs: list[Path]) -> Path | None:
+    """Return the newest input that is newer than the receipt, if any."""
+    newest = None
+    for path in inputs:
+        if not path.is_file():
+            continue
+        if path.stat().st_mtime > report.stat().st_mtime + 1:
+            if newest is None or path.stat().st_mtime > newest.stat().st_mtime:
+                newest = path
+    return newest
+
+
+def rerun_tests(build: Path, config: str) -> Path:
+    """Run the registered suite and return a fresh JUnit receipt."""
+    receipt = build / "packaging-receipt.xml"
+    receipt.unlink(missing_ok=True)
+    subprocess.run(["ctest", "--test-dir", str(build), "-C", config,
+                    "--output-junit", str(receipt)], check=True)
+    required(receipt.is_file(), "CTest did not produce a JUnit receipt")
+    return receipt
 
 
 def build_artifact(build: Path, name: str, config: str) -> Path:
@@ -102,6 +138,8 @@ def main() -> int:
     parser.add_argument("--artifacts", type=Path, default=ROOT / "artifacts")
     parser.add_argument("--test-report", type=Path, default=ROOT / f"build/validation-{VERSION}.xml",
                         help="JUnit XML produced by ctest --output-junit")
+    parser.add_argument("--no-rerun-tests", action="store_true",
+                        help="trust the supplied receipt instead of rerunning the registered suite")
     args = parser.parse_args()
     build = args.build.resolve()
     stage = args.stage.resolve()
@@ -119,7 +157,15 @@ def main() -> int:
     )
     expected_tests = {item["name"] for item in json.loads(inventory.stdout).get("tests", [])}
     required(bool(expected_tests), "CTest reports no registered tests")
-    required(report.is_file(), f"missing CTest JUnit report: {report}")
+    if args.no_rerun_tests:
+        required(report.is_file(), f"missing CTest JUnit report: {report}")
+        stale = stale_receipt(report, test_inputs(build, args.config))
+        required(stale is None, f"stale CTest receipt: {report} predates {stale}")
+    else:
+        # A receipt is only provenance if it was produced from the current tree.
+        # Rerun the registered suite so an independent test executable or script
+        # change cannot be packaged behind an old green receipt.
+        report = rerun_tests(build, args.config)
     suite = ET.parse(report).getroot()
     tests = list(suite.iter("testcase"))
     actual_tests = {test.attrib.get("name", "") for test in tests}
@@ -141,9 +187,6 @@ def main() -> int:
 
     dll = build_artifact(build, "FreezeSentryF4.dll", args.config)
     watch = build_artifact(build, "FreezeSentryF4Watch.exe", args.config)
-    newest_output = max(dll.stat().st_mtime, watch.stat().st_mtime)
-    required(report.stat().st_mtime >= newest_output - 1,
-             f"stale CTest receipt: {report} predates the build outputs")
     required(not stage.exists(), f"refusing to replace existing package stage: {stage}")
     required(stage.is_relative_to(ROOT / "build"), "package stage must stay under the repository build directory")
     generated_outputs = []

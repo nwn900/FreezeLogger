@@ -1,8 +1,10 @@
 import contextlib
 import io
+import os
 import struct
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -174,7 +176,8 @@ class PackageSkipPolicyTests(unittest.TestCase):
         self.assertEqual(len(accepted), 2)
         self.assertEqual(rejected, [])
         self.assertEqual(package.qualification(accepted),
-                         {"runtime_layout_qualified": False, "etw_available": False})
+                         {"runtime_layout_qualified": False, "etw_available": False,
+                          "pss_clone_qualified": True})
 
     def test_unexpected_skip_is_rejected(self):
         accepted, rejected = package.classify_skips([{"test": "engine-context", "evidence": "skipped"}])
@@ -189,6 +192,57 @@ class PackageSkipPolicyTests(unittest.TestCase):
         ])
         self.assertEqual(len(accepted), 2)
         self.assertEqual([entry["test"] for entry in rejected], ["diagnostics"])
+
+    def test_snapshot_only_skip_is_accepted(self):
+        accepted, rejected = package.classify_skips(
+            [{"test": "snapshot-cleanup", "evidence": "SKIP: self snapshot unavailable"}])
+        self.assertEqual([entry["test"] for entry in accepted], ["snapshot-cleanup"])
+        self.assertEqual(rejected, [])
+        self.assertFalse(package.qualification(accepted)["pss_clone_qualified"])
+        self.assertTrue(package.qualification(accepted)["runtime_layout_qualified"])
+
+    def test_combined_expected_skips_are_accepted(self):
+        accepted, rejected = package.classify_skips([
+            {"test": "real-dxgi-etw", "evidence": "ETW unavailable"},
+            {"test": "layout-rows", "evidence": "SKIP: no executable"},
+            {"test": "snapshot-cleanup", "evidence": "SKIP: self snapshot unavailable"},
+        ])
+        self.assertEqual(len(accepted), 3)
+        self.assertEqual(rejected, [])
+        self.assertEqual(package.qualification(accepted),
+                         {"runtime_layout_qualified": False, "etw_available": False,
+                          "pss_clone_qualified": False})
+
+
+class PackageReceiptFreshnessTests(unittest.TestCase):
+    def test_stale_receipt_detects_newer_test_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = root / "receipt.xml"
+            report.write_text("<testsuite/>", encoding="utf-8")
+            old = time.time() - 100
+            os.utime(report, (old, old))
+            exe = root / "FreezeSentryF4ExceptionTests.exe"
+            exe.write_bytes(b"MZ")
+            os.utime(exe, (old, old))
+            self.assertIsNone(package.stale_receipt(report, [exe]))
+            newer = time.time() + 100
+            os.utime(exe, (newer, newer))
+            self.assertEqual(package.stale_receipt(report, [exe]), exe)
+
+    def test_test_inputs_cover_independent_executables_and_scripts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            build = Path(temporary)
+            output = build / "RelWithDebInfo"
+            output.mkdir()
+            (output / "FreezeSentryF4ExceptionTests.exe").write_bytes(b"MZ")
+            (output / "FreezeSentryF4.dll").write_bytes(b"MZ")
+            inputs = package.test_inputs(build, "RelWithDebInfo")
+            names = {path.name for path in inputs}
+            self.assertIn("FreezeSentryF4ExceptionTests.exe", names)
+            self.assertIn("FreezeSentryF4.dll", names)
+            self.assertIn("CMakeLists.txt", names)
+            self.assertTrue(any(path.suffix == ".py" for path in inputs))
 
 
 if __name__ == "__main__":
