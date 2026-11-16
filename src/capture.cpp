@@ -23,8 +23,9 @@
 #include <mutex>
 
 namespace fs {
-namespace { bool (*commitProbe)() = nullptr; }
+namespace { bool (*commitProbe)() = nullptr; bool (*pssProbe)() = nullptr; }
 void setCommitProbeForTest(bool (*probe)()) { commitProbe = probe; }
+void setPssProbeForTest(bool (*probe)()) { pssProbe = probe; }
 std::filesystem::path reportRoot(bool vr) {
     PWSTR documents = nullptr;
     auto result = SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &documents);
@@ -234,12 +235,11 @@ std::string waitChains(const std::vector<DWORD>& ids) {
 }
 template<class T> bool remote(HANDLE process, DWORD64 address, T& value) {
     SIZE_T size = 0;
-    RpmStats::calls().fetch_add(1, std::memory_order_relaxed);
     if (ReadProcessMemory(process, reinterpret_cast<void*>(address), &value, sizeof(value), &size) && size == sizeof(value)) {
-        RpmStats::bytes().fetch_add(size, std::memory_order_relaxed);
+        captureRpm().record(size);
         return true;
     }
-    RpmStats::failures().fetch_add(1, std::memory_order_relaxed);
+    captureRpm().fail();
     return false;
 }
 std::string rtti(HANDLE process, DWORD64 address, const std::vector<Module>& modules) {
@@ -582,21 +582,27 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     bool cloneMode = commitAvailableForClone();
     if (!cloneMode) log << "snapshot_clone_deferred_low_commit; attempting thread-only fallback\n";
     auto captureBegan = now();
-    auto flags = cloneMode
-        ? static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_VA_CLONE | PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT)
-        : static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT);
-    DWORD error = PssCaptureSnapshot(target, flags, CONTEXT_ALL, &snapshot.value);
-    if (error != ERROR_SUCCESS && cloneMode) {
-        log << "snapshot_error=" << error << " clone_mode=1; attempting thread-only fallback\n";
-        cloneMode = false;
-        captureBegan = now();
-        flags = static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT);
+    DWORD error = ERROR_NOT_SUPPORTED;
+    if (pssProbe && !pssProbe()) {
+        log << "pss_capture_disabled_by_test_probe; using Toolhelp thread inventory\n";
+    } else {
+        auto flags = cloneMode
+            ? static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_VA_CLONE | PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT)
+            : static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT);
         error = PssCaptureSnapshot(target, flags, CONTEXT_ALL, &snapshot.value);
+        if (error != ERROR_SUCCESS && cloneMode) {
+            log << "snapshot_error=" << error << " clone_mode=1; attempting thread-only fallback\n";
+            cloneMode = false;
+            captureBegan = now();
+            flags = static_cast<PSS_CAPTURE_FLAGS>(PSS_CAPTURE_THREADS | PSS_CAPTURE_THREAD_CONTEXT);
+            error = PssCaptureSnapshot(target, flags, CONTEXT_ALL, &snapshot.value);
+        }
     }
     if (error != ERROR_SUCCESS) {
         // Last resort: thread identities and wait reasons without any snapshot.
         log << "snapshot_error=" << error << " clone_mode=0; using Toolhelp thread inventory\n";
         log << "capture_method=toolhelp-thread-inventory omitted=contexts,stacks,modules,symbols,minidump\n";
+        log << "minidump=skipped (PSS unavailable; no snapshot)\n";
         MEMORYSTATUSEX systemMemory{}; systemMemory.dwLength = sizeof(systemMemory);
         if (GlobalMemoryStatusEx(&systemMemory))
             log << "system_available_physical=" << systemMemory.ullAvailPhys
@@ -614,7 +620,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
                 } while (Thread32Next(toolhelp, &entry));
             }
             CloseHandle(toolhelp);
-        }
+        } else log << "toolhelp_error=" << GetLastError() << '\n';
         log << "thread_count=" << count << " capture_method=toolhelp\n";
         sampled |= count > 0;
         if (writeWerFallbackHint(folder, gameImage)) log << "wer_fallback_hint=written\n";

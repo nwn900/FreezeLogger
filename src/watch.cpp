@@ -287,9 +287,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 }
                 session << "stage_stats context_ms=" << contextMs << " profile_ms=" << profileMs
                         << " inventory_ms=" << inventoryMs
-                        << " rpm_calls=" << fs::RpmStats::calls().load(std::memory_order_relaxed)
-                        << " rpm_failures=" << fs::RpmStats::failures().load(std::memory_order_relaxed)
-                        << " rpm_bytes=" << fs::RpmStats::bytes().load(std::memory_order_relaxed) << '\n';
+                        << " context_rpm_calls=" << fs::contextRpm().calls.load(std::memory_order_relaxed)
+                        << " context_rpm_failures=" << fs::contextRpm().failures.load(std::memory_order_relaxed)
+                        << " context_rpm_bytes=" << fs::contextRpm().bytes.load(std::memory_order_relaxed)
+                        << " capture_rpm_calls=" << fs::captureRpm().calls.load(std::memory_order_relaxed)
+                        << " capture_rpm_failures=" << fs::captureRpm().failures.load(std::memory_order_relaxed)
+                        << " capture_rpm_bytes=" << fs::captureRpm().bytes.load(std::memory_order_relaxed) << '\n';
                 session.flush();
                 stopReason = StopReason::TargetExited;
                 break;
@@ -430,9 +433,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                     << " ETW_status=" << fs::read(state->frameStatus)
                     << " stage_context_ms=" << contextMs << " stage_profile_ms=" << profileMs
                     << " stage_inventory_ms=" << inventoryMs
-                    << " rpm_calls=" << fs::RpmStats::calls().load(std::memory_order_relaxed)
-                    << " rpm_failures=" << fs::RpmStats::failures().load(std::memory_order_relaxed)
-                    << " rpm_bytes=" << fs::RpmStats::bytes().load(std::memory_order_relaxed) << '\n';
+                    << " context_rpm_calls=" << fs::contextRpm().calls.load(std::memory_order_relaxed)
+                    << " context_rpm_failures=" << fs::contextRpm().failures.load(std::memory_order_relaxed)
+                    << " context_rpm_bytes=" << fs::contextRpm().bytes.load(std::memory_order_relaxed)
+                    << " capture_rpm_calls=" << fs::captureRpm().calls.load(std::memory_order_relaxed)
+                    << " capture_rpm_failures=" << fs::captureRpm().failures.load(std::memory_order_relaxed)
+                    << " capture_rpm_bytes=" << fs::captureRpm().bytes.load(std::memory_order_relaxed) << '\n';
                 auto profileBegan = fs::now();
                 auto profileText = fs::profile(target, early, state);
                 profileMs += fs::now() - profileBegan;

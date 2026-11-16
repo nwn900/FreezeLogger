@@ -166,15 +166,23 @@ struct alignas(8) Shared {
 inline LONG64 read(volatile LONG64& value) { return InterlockedCompareExchange64(&value, 0, 0); }
 inline LONG read(volatile LONG& value) { return InterlockedCompareExchange(&value, 0, 0); }
 inline LONG64 now() { return static_cast<LONG64>(GetTickCount64()); }
-// Process-wide ReadProcessMemory accounting for the overhead budget. The
-// collector reports these counters so a heavy modded session can be measured
-// instead of guessed at.
-struct RpmStats {
-    static std::atomic<unsigned long long>& calls() { static std::atomic<unsigned long long> value{0}; return value; }
-    static std::atomic<unsigned long long>& failures() { static std::atomic<unsigned long long> value{0}; return value; }
-    static std::atomic<unsigned long long>& bytes() { static std::atomic<unsigned long long> value{0}; return value; }
-    static void reset() { calls() = 0; failures() = 0; bytes() = 0; }
+// ReadProcessMemory accounting for the overhead budget. The context reader and
+// the capture collector are counted separately so a log field cannot be read as
+// "all process reads" when it only covers one instrumented path.
+struct RpmCounter {
+    std::atomic<unsigned long long> calls{0}, failures{0}, bytes{0};
+    void record(unsigned long long count) {
+        calls.fetch_add(1, std::memory_order_relaxed);
+        bytes.fetch_add(count, std::memory_order_relaxed);
+    }
+    void fail() {
+        calls.fetch_add(1, std::memory_order_relaxed);
+        failures.fetch_add(1, std::memory_order_relaxed);
+    }
+    void reset() { calls = 0; failures = 0; bytes = 0; }
 };
+inline RpmCounter& contextRpm() { static RpmCounter value; return value; }
+inline RpmCounter& captureRpm() { static RpmCounter value; return value; }
 inline LONG64 filetime(FILETIME t) { return (static_cast<LONG64>(t.dwHighDateTime) << 32) | t.dwLowDateTime; }
 struct Handle {
     HANDLE value = nullptr;
@@ -200,8 +208,9 @@ struct StallGate {
     void rearm() { reported = false; }
 };
 std::filesystem::path reportRoot(bool vr);
-// Test-only injection point for the capture availability checks.
+// Test-only injection points for the capture availability checks.
 void setCommitProbeForTest(bool (*probe)());
+void setPssProbeForTest(bool (*probe)());
 bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
              const std::string& reason, Shared* state, bool dump, const std::string& history = {},
              bool quick = false);

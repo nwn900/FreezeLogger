@@ -14,12 +14,11 @@ struct Reader {
     DWORD size;
     bool bytes(ULONG64 address, void* output, size_t count) const {
         SIZE_T got = 0;
-        RpmStats::calls().fetch_add(1, std::memory_order_relaxed);
         bool ok = address >= 0x10000 && address <= 0x00007fffffff0000ULL && count <= 1024 * 1024 &&
             count <= 0x00007fffffff0000ULL - address &&
             ReadProcessMemory(process, reinterpret_cast<void*>(address), output, count, &got) && got == count;
-        if (ok) RpmStats::bytes().fetch_add(count, std::memory_order_relaxed);
-        else RpmStats::failures().fetch_add(1, std::memory_order_relaxed);
+        if (ok) contextRpm().record(count);
+        else contextRpm().fail();
         return ok;
     }
     template<class T> bool get(ULONG64 address, T& output) const { return bytes(address, &output, sizeof(output)); }
