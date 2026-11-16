@@ -1,7 +1,10 @@
 #include "../src/exceptions.hpp"
 #include <windows.h>
+#include <array>
 #include <iostream>
+#include <fstream>
 #include <sstream>
+#include <string>
 #include <thread>
 
 namespace {
@@ -19,9 +22,74 @@ void handledCppThrow() {
     __try { RaiseException(0xE06D7363u, 0, 0, nullptr); }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
+
+// Child-process terminal fixture: a second, well-behaved crash handler is
+// registered either before or after the journal, and both orders must still
+// publish exactly one terminal incident while chaining to the other handler.
+LPTOP_LEVEL_EXCEPTION_FILTER previousDummy = nullptr;
+std::wstring markerPath;
+LONG WINAPI dummyFilter(EXCEPTION_POINTERS* exception) {
+    HANDLE marker = CreateFileW(markerPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (marker != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(marker, "called", 6, &written, nullptr);
+        CloseHandle(marker);
+    }
+    return previousDummy ? previousDummy(exception) : EXCEPTION_CONTINUE_SEARCH;
 }
 
-int wmain() {
+int terminalChild(const wchar_t* mappingName, const wchar_t* marker, const wchar_t* order) {
+    markerPath = marker;
+    fs::Handle mapping(OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, mappingName));
+    if (!mapping.value) return 2;
+    auto* shared = static_cast<fs::Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(fs::Shared)));
+    if (!shared) return 3;
+    fs::ExceptionJournal journal(shared);
+    if (std::wstring(order) == L"dummy-first") {
+        SetUnhandledExceptionFilter(dummyFilter);
+        if (!journal.install(shared)) return 4;
+    } else {
+        if (!journal.install(shared)) return 4;
+        previousDummy = SetUnhandledExceptionFilter(dummyFilter);
+    }
+    RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr); // unhandled: terminal
+    return 5; // not reached
+}
+
+bool runTerminalChild(const wchar_t* order) {
+    auto name = L"Local\\FSF4-terminal-" + std::to_wstring(GetCurrentProcessId()) + L"-" + order;
+    auto marker = std::filesystem::current_path() / (std::wstring(L"terminal-marker-") + order + L".txt");
+    std::error_code ignored; std::filesystem::remove(marker, ignored);
+    fs::Handle mapping(CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(fs::Shared), name.c_str()));
+    if (!mapping.value) return false;
+    auto* shared = static_cast<fs::Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(fs::Shared)));
+    if (!shared) return false;
+    new (shared) fs::Shared;
+    std::array<wchar_t, 32768> exe{};
+    DWORD length = GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+    if (!length || length >= exe.size()) return false;
+    std::wstring command = L"\"" + std::wstring(exe.data(), length) + L"\" --terminal-child \"" + name +
+        L"\" \"" + marker.wstring() + L"\" " + order;
+    STARTUPINFOW startup{}; startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    bool started = CreateProcessW(exe.data(), command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process) != FALSE;
+    if (!started) return false;
+    WaitForSingleObject(process.hProcess, 15000);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    bool published = fs::read(shared->crashSequence) == 2 && shared->crashCode == EXCEPTION_ACCESS_VIOLATION;
+    bool chained = std::filesystem::exists(marker);
+    UnmapViewOfFile(shared);
+    return exitCode == EXCEPTION_ACCESS_VIOLATION && published && chained;
+}
+}
+
+int wmain(int argc, wchar_t** argv) {
+    if (argc == 5 && std::wstring(argv[1]) == L"--terminal-child")
+        return terminalChild(argv[2], argv[3], argv[4]);
+
     {
         fs::Shared shared{};
         shared.faultCount = 2;
@@ -110,6 +178,11 @@ int wmain() {
               "a throw on another thread cannot be combined with this thread's abort");
     }
 
-    std::cout << "PASS: exception ring, provisional/terminal split and coherent throw record\n";
+    // A real unhandled fault in a controlled child process still produces one
+    // terminal incident, in both crash-handler registration orders.
+    check(runTerminalChild(L"dummy-first"), "terminal child with a pre-registered handler publishes and chains");
+    check(runTerminalChild(L"journal-first"), "terminal child with a later handler publishes through the chain");
+
+    std::cout << "PASS: exception ring, provisional/terminal split, coherent throw record and child terminal capture\n";
     return 0;
 }
