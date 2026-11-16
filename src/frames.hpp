@@ -36,17 +36,25 @@ public:
         if (native.status == FrameReadStatus::Busy) {
             if (nativeFresh) return native_;
             // A busy first read is unknown, not absent: do not fall back before
-            // a native source has ever published. A previously seen native
-            // source that is now stale does hand over to ETW.
-            if (hasNative_ && etwAvailable && hasEtw_) {
-                FrameSelection result = etw_; result.nativeExpired = true; return result;
+            // a native source has ever published.
+            if (hasNative_) {
+                if (etwAvailable && hasEtw_) { FrameSelection result = etw_; result.nativeExpired = true; return result; }
+                // ETW is unavailable or has never published usable frames. Keep
+                // the last native sample as stalled evidence instead of
+                // discarding the only frame signal: an unobserved source is not
+                // a healthy one.
+                FrameSelection result = native_; result.nativeExpired = true; return result;
             }
             return {};
         }
         if (nativeFresh) return native_;
+        if (hasNative_) {
+            if (etwAvailable && hasEtw_) { FrameSelection result = etw_; result.nativeExpired = true; return result; }
+            FrameSelection result = native_; result.nativeExpired = true; return result;
+        }
         if (!etwAvailable) return {};
         if (etw.status == FrameReadStatus::Busy) return hasEtw_ ? etw_ : FrameSelection{};
-        if (hasEtw_) { FrameSelection result = etw_; result.nativeExpired = hasNative_; return result; }
+        if (hasEtw_) { FrameSelection result = etw_; return result; }
         return {};
     }
 private:

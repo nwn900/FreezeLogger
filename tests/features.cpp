@@ -77,6 +77,38 @@ int wmain(int argc, wchar_t** argv) {
         check(frozen.source == 1 && frozen.sample.tick == 1000, "frozen native hands over to frozen ETW");
         check(!gate.sample(4000, frozen, true, false, 2000), "handover rebases without a spurious immediate report");
         check(gate.sample(4001, frozen, true, false, 2000), "handover to an equally frozen source still reports the stall");
+
+        // Native-only stall: ETW is unavailable, so the last native sample must
+        // stay as stalled evidence instead of resetting the gate.
+        fs::FrameSignal nativeOnly;
+        for (int i = 0; i < 10; ++i) check(nativeOnly.publish(1000, 1000, 3), "native-only fixture publication");
+        fs::FrameProviderSelector nativeOnlySelector;
+        auto nativeOnlySample = nativeOnlySelector.select(nativeOnly.snapshot(), {}, false, 1000);
+        check(nativeOnlySample.source == 2, "native-only source selected while fresh");
+        fs::FrameGate nativeOnlyGate;
+        check(!nativeOnlyGate.sample(1000, nativeOnlySample, true, false, 15000), "native-only gate arms");
+        auto staleNative = nativeOnlySelector.select(nativeOnly.snapshot(), {}, false, 3001);
+        check(staleNative.source == 2 && staleNative.nativeExpired,
+              "stale native sample is retained as evidence when ETW is unavailable");
+        check(!nativeOnlyGate.sample(3001, staleNative, true, false, 15000),
+              "stale native sample does not reset the gate");
+        check(nativeOnlyGate.sample(16001, staleNative, true, false, 15000),
+              "native-only stall is reported after the configured timeout");
+        check(!nativeOnlyGate.sample(17000, staleNative, true, false, 15000),
+              "native-only stall is reported once");
+        check(nativeOnly.publish(18000, 18000, 3), "native-only recovery publication");
+        auto recovered = nativeOnlySelector.select(nativeOnly.snapshot(), {}, false, 18000);
+        check(recovered.source == 2 && !recovered.nativeExpired, "returning native source is fresh again");
+        check(!nativeOnlyGate.sample(18000, recovered, true, false, 15000), "recovery rearms the gate");
+        check(nativeOnlyGate.sample(34000, recovered, true, false, 15000),
+              "second native-only stall is reported after recovery");
+        fs::FrameGate slowGate;
+        check(!slowGate.sample(1000, nativeOnlySample, true, false, 30000), "slow gate arms");
+        check(!slowGate.sample(20000, staleNative, true, false, 30000), "slow gate waits for its 30 s timeout");
+        check(slowGate.sample(31001, staleNative, true, false, 30000), "slow gate reports at 30 s");
+        fs::FrameProviderSelector emptySelector;
+        check(emptySelector.select({}, {}, false, 5000).source == 0,
+              "both sources absent from the start stays unavailable");
         LONG64 eventTick = 0;
         check(fs::frameTickFromQpc(100000, 200000, 1000000, 10000, eventTick) && eventTick == 9900,
               "ETW presentation timestamp maps from QPC to monotonic milliseconds");
