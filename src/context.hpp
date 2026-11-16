@@ -28,12 +28,5 @@ public:
     EngineContext sample() const;
     const std::string& qualification() const { return status; }
 };
-// Scans a code buffer for the player-global pattern: a RIP-relative load whose
-// destination is then dereferenced at the parentCell offset. Returns the RVA of
-// the most-referenced candidate, or 0 when the result is not decisive. This is
-// what lets the player half work on a runtime with no layout row, because the
-// loaded image is decrypted even when the file on disk is not.
-std::uint64_t scanPlayerGlobal(const BYTE* code, std::size_t size, std::uint64_t codeRva,
-                               std::uint32_t cellOffset);
 std::string diskSHA256(const std::filesystem::path& path);
 }
