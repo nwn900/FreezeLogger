@@ -81,6 +81,32 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         if (frameStart) InterlockedExchange(&state->frameStatus, static_cast<LONG>(frameStart));
         session << "DXGI_ETW_status=" << fs::read(state->frameStatus) << " (nonzero: unavailable; no elevation requested)\n";
         session.flush();
+        // Optional runtime overrides let a derived row be added without a
+        // rebuild. The file sits next to the watcher, which is the same folder
+        // as the plugin, and every row still goes through structural validation.
+        fs::LayoutOverrides overrides;
+        {
+            std::array<wchar_t, 32768> self{};
+            DWORD selfLength = GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size()));
+            if (selfLength && selfLength < self.size()) {
+                std::ifstream layoutIni(std::filesystem::path(self.data()).parent_path() / "FreezeSentryF4.layout.ini",
+                                        std::ios::binary);
+                if (layoutIni) {
+                    // Bounded read: the file is user-supplied and only ever
+                    // needs a handful of short sections.
+                    std::string text(64 * 1024, '\0');
+                    layoutIni.read(text.data(), static_cast<std::streamsize>(text.size()));
+                    text.resize(static_cast<std::size_t>(layoutIni.gcount()));
+                    auto accepted = fs::parseLayoutOverrides(text, overrides);
+                    session << "layout_overrides=" << accepted << '\n';
+                    session.flush();
+                }
+            }
+        }
+        // Resolve the engine layout before the receipt so the receipt can state
+        // which context halves this runtime actually qualified for.
+        fs::ContextObserver context(target, state->runtime, state->contextMonitoring != 0, &overrides);
+        session << "context_adapter=" << context.qualification() << '\n'; session.flush();
         { // Startup compatibility snapshot: versions, thresholds and memory headroom in one machine-readable file.
             MEMORYSTATUSEX memory{};
             memory.dwLength = sizeof(memory);
@@ -99,6 +125,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                       << "  \"task_monitoring\": " << state->taskMonitoring << ",\n"
                       << "  \"frame_monitoring\": " << state->frameMonitoring << ",\n"
                       << "  \"context_monitoring\": " << state->contextMonitoring << ",\n"
+                      << "  \"context_qualification\": \"" << fs::jsonEscape(context.qualification()) << "\",\n"
                       << "  \"suppress_background\": " << state->suppressBackground << ",\n"
                       << "  \"foreground_grace_sec\": " << state->foregroundGraceSec << ",\n"
                       << "  \"max_reports_legacy\": " << state->maxReports << ",\n"
@@ -114,8 +141,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         }
         fs::History history(state->historyMs);
         fs::ExceptionJournal exceptionJournal(state);
-        fs::ContextObserver context(target, state->runtime, state->contextMonitoring != 0);
-        session << "context_adapter=" << context.qualification() << '\n'; session.flush();
         fs::EngineContext currentContext, lastContext;
         fs::EngineContext lastReadable;
         LONG64 lastCellTick = 0, lastMenusTick = 0;

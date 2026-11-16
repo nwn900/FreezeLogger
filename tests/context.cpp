@@ -12,6 +12,58 @@ template<class T, size_t N> void put(std::array<BYTE, N>& memory, size_t offset,
 template<class T> ULONG64 pointer(T& value) { return reinterpret_cast<ULONG64>(&value); }
 }
 int main() {
+    // Layout table: exact runtime match, independent player/menu capabilities.
+    const auto* modern = fs::resolveLayout(0x010A0A30);
+    check(modern && fs::hasPlayer(*modern) && fs::hasMenus(*modern), "1.10.163 layout carries both halves");
+    const auto* next = fs::resolveLayout(0x010B0DD0);
+    check(next && fs::hasPlayer(*next) && fs::hasMenus(*next), "1.11.221 layout carries both halves");
+    check(!fs::resolveLayout(0xFFFFFFFF) && !fs::resolveLayout(0), "unknown runtime resolves to no layout");
+    check(modern->playerRva != next->playerRva, "player global is per-runtime, not shared");
+    // Table hygiene: unique runtimes, every row usable, offsets inside a plausible object.
+    for (std::size_t i = 0; i < std::size(fs::layouts); ++i) {
+        check(fs::layouts[i].runtime != 0, "layout row has a runtime key");
+        check(fs::hasPlayer(fs::layouts[i]) || fs::hasMenus(fs::layouts[i]), "layout row carries at least one half");
+        for (std::size_t j = i + 1; j < std::size(fs::layouts); ++j)
+            check(fs::layouts[i].runtime != fs::layouts[j].runtime, "layout runtimes are unique");
+        for (auto offset : {fs::layouts[i].playerCellOffset, fs::layouts[i].cellFormIdOffset,
+                            fs::layouts[i].cellTypeOffset, fs::layouts[i].cellNameOffset,
+                            fs::layouts[i].cellSourceOffset, fs::layouts[i].uiStackOffset,
+                            fs::layouts[i].uiTableOffset})
+            check(offset < 0x1000, "layout offset stays inside a plausible object");
+    }
+
+    // Runtime overrides: a derived row can be added without a rebuild.
+    fs::LayoutOverrides overrides;
+    const char* ini =
+        "; derived elsewhere\n"
+        "[Layout.010C0000]\n"
+        "PlayerRva=0x1111\n"
+        "UiRva=0x2222\n"
+        "PlayerCellOffset=0xB8\n"
+        "CellFormIdOffset=0x14\n"
+        "CellTypeOffset=0x1A\n"
+        "UiStackOffset=0x190\n"
+        "UiTableOffset=0x1B0\n"
+        "UiTableEntriesOffset=0x20\n"
+        "MenuStride=0x28\n"
+        "MenuNameOffset=0x08\n"
+        "MenuInstanceOffset=0x10\n"
+        "MenuNextOffset=0x20\n"
+        "UnknownKey=0x99\n";
+    check(fs::parseLayoutOverrides(ini, overrides) == 1, "one override row parsed");
+    const auto* custom = fs::resolveLayout(0x010C0000, &overrides);
+    check(custom && custom->playerRva == 0x1111 && custom->uiRva == 0x2222, "override row is used");
+    check(fs::hasPlayer(*custom) && fs::hasMenus(*custom), "override row carries both halves");
+    check(fs::resolveLayout(0x010A0A30, &overrides) == modern, "built-in rows still resolve with overrides present");
+    check(!fs::resolveLayout(0x010C0000), "override does not leak without the table");
+    fs::LayoutOverrides empty;
+    check(fs::parseLayoutOverrides("[Layout.zzzz]\nPlayerRva=1\n", empty) == 0, "malformed runtime key rejected");
+    check(fs::parseLayoutOverrides("[Other]\nPlayerRva=1\n", empty) == 0, "non-layout section ignored");
+    fs::LayoutOverrides hollow;
+    check(fs::parseLayoutOverrides("[Layout.010A0A30]\nUnknownKey=1\n", hollow) == 0,
+          "empty override is dropped so it cannot shadow a built-in row");
+    check(fs::resolveLayout(0x010A0A30, &hollow) == modern, "built-in row survives an empty override");
+
     HMODULE image = GetModuleHandleW(nullptr); MODULEINFO info{};
     check(GetModuleInformation(GetCurrentProcess(), image, &info, sizeof(info)) != 0, "fixture image");
     auto base = reinterpret_cast<ULONG64>(image);
@@ -32,10 +84,38 @@ int main() {
     put(ui, 0x1B4, DWORD{1}); put(ui, 0x1D0, pointer(menu));
     put(menu, 0, pointer(menuName)); put(menu, 8, active); put(menu, 0x20, ULONG64{1});
     strcpy_s(reinterpret_cast<char*>(menuName.data() + 0x18), 256, "LoadingMenu");
-    auto sample = [&] { return fs::readContext163(GetCurrentProcess(), pointer(playerGlobal), pointer(uiGlobal), base, info.SizeOfImage); };
+    auto sample = [&] { return fs::readContext(GetCurrentProcess(), *modern, pointer(playerGlobal), pointer(uiGlobal), base, info.SizeOfImage); };
     auto frame = sample();
     check(frame.cellValid && frame.cell == 0x05123456 && frame.cellName == "Fixture cell" && frame.origin == "Fixture.esp", "real RPM cell/name/standard origin");
     check(frame.menusValid && frame.loading(), "menu-stack name and loading phase");
+
+    // The 1.11.221 row uses a different table and entry shape. The decoder must
+    // follow the row rather than a fixed struct, so build that shape and check
+    // it decodes to the same answer.
+    std::array<BYTE, 0x1E0> ui2{};
+    std::array<BYTE, 0x28> menu2{};
+    std::array<BYTE, 0x18 + 256> menuName2{};
+    ULONG64 active2 = 0x567800;
+    put(ui2, 0, base);
+    put(ui2, 0x190, pointer(active2)); put(ui2, 0x198, DWORD{1}); put(ui2, 0x1A0, DWORD{1});
+    put(ui2, 0x1B4, DWORD{1}); put(ui2, 0x1D0, pointer(menu2));
+    put(menu2, 8, pointer(menuName2)); put(menu2, 0x10, active2); put(menu2, 0x20, ULONG64{1});
+    strcpy_s(reinterpret_cast<char*>(menuName2.data() + 0x18), 256, "LoadingMenu");
+    ULONG64 uiGlobal2 = pointer(ui2);
+    auto nextFrame = fs::readContext(GetCurrentProcess(), *next, pointer(playerGlobal), pointer(uiGlobal2), base, info.SizeOfImage);
+    check(nextFrame.menusValid && nextFrame.loading(), "1.11.221 table and entry shapes decode through the row");
+    put(menu2, 0x10, ULONG64{0x9999});
+    auto nextMiss = fs::readContext(GetCurrentProcess(), *next, pointer(playerGlobal), pointer(uiGlobal2), base, info.SizeOfImage);
+    check(!nextMiss.menusValid, "1.11.221 instance mismatch is rejected, not guessed");
+
+    // A row with addresses but no usable entry shape must not index an empty
+    // buffer or read past an entry.
+    auto noStride = *next; noStride.menuStride = 0;
+    auto noStrideFrame = fs::readContext(GetCurrentProcess(), noStride, pointer(playerGlobal), pointer(uiGlobal2), base, info.SizeOfImage);
+    check(!noStrideFrame.menusValid, "zero stride is refused instead of indexed");
+    auto badField = *next; badField.menuNameOffset = 0x30;
+    auto badFieldFrame = fs::readContext(GetCurrentProcess(), badField, pointer(playerGlobal), pointer(uiGlobal2), base, info.SizeOfImage);
+    check(!badFieldFrame.menusValid, "field offset outside the stride is refused");
     put(cell, 0x14, DWORD{0xFE123456}); put(file, 0x334, DWORD{0x200}); put(file, 0x372, WORD{0x123});
     strcpy_s(reinterpret_cast<char*>(file.data() + 0x70), 260, "Fixture.esl");
     frame = sample(); check(frame.cellValid && frame.origin == "Fixture.esl", "ESL partial-index origin");
@@ -46,13 +126,41 @@ int main() {
     put(menu, 0x20, ULONG64{1}); put(ui, 0x1B4, DWORD{4096});
     check(!sample().menusValid, "unbounded hash rejected"); put(ui, 0x1B4, DWORD{1});
     put(cellName, 8, DWORD{0x4000}); put(cellName, 0x10, pointer(cellName));
-    check(!sample().cellValid, "external string cycle rejected"); put(cellName, 8, DWORD{0});
+    auto cycle = sample();
+    check(cycle.cellValid && cycle.cellName.empty(), "external string cycle rejected, identity kept");
+    put(cellName, 8, DWORD{0});
     playerGlobal = ~ULONG64{0}; check(!sample().cellValid, "unreadable player pointer rejected");
     playerGlobal = pointer(player); put(cell, 0x1A, BYTE{65});
     check(!sample().cellValid, "wrong cell type rejected");
+    put(cell, 0x1A, BYTE{63});
+
+    // Name and file association are best effort; identity is type plus FormID.
+    put(cell, 0x28, ULONG64{0xDEADBEEF});
+    auto unnamed = sample();
+    check(unnamed.cellValid && unnamed.cell == 0xFE123456 && unnamed.cellName.empty(),
+          "unreadable name keeps the cell identity");
+    put(cell, 0x28, pointer(cellName));
+    put(cell, 8, ULONG64{0xDEADBEEF});
+    auto unsourced = sample();
+    check(unsourced.cellValid && unsourced.files.find("unavailable") != std::string::npos,
+          "unreadable association keeps the cell identity");
+    put(cell, 8, pointer(sources));
+
+    // A partial layout must still deliver the half it has and stay silent on the other.
+    auto partial = *next;
+    auto partialFrame = fs::readContext(GetCurrentProcess(), partial, pointer(playerGlobal), 0, base, info.SizeOfImage);
+    check(partialFrame.cellValid && partialFrame.cell == 0xFE123456, "player-only layout still reads the cell");
+    check(!partialFrame.menusValid && partialFrame.menus.empty(), "player-only layout never invents menus");
+    auto noPlayer = *modern; noPlayer.playerRva = 0;
+    auto menuOnly = fs::readContext(GetCurrentProcess(), noPlayer, 0, pointer(uiGlobal), base, info.SizeOfImage);
+    check(!menuOnly.cellValid && menuOnly.menusValid, "menu-only layout reads menus without a player global");
+
     fs::ContextObserver unsupported(GetCurrentProcess(), 0xFFFFFFFF, true);
     check(!unsupported.sample().cellValid && !unsupported.sample().menusValid, "unknown runtime has no engine reads");
+    check(unsupported.qualification().find("no engine layout") != std::string::npos, "unknown runtime explains itself");
     fs::ContextObserver wrongImage(GetCurrentProcess(), 0x010A0A30, true);
     check(!wrongImage.sample().cellValid, "runtime alone cannot enable offsets in fixture executable");
-    std::cout << "PASS: external cell/menu decoder, ESP/ESL origins, bounds, string cycles, identity gating\n";
+    fs::ContextObserver disabled(GetCurrentProcess(), 0x010A0A30, false);
+    check(!disabled.sample().cellValid, "ContextMonitoring=0 disables the adapter");
+    std::cout << "PASS: layout table, per-half degradation, external cell/menu decoder, ESP/ESL origins, bounds, string cycles, identity gating\n";
 }
