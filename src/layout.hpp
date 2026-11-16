@@ -136,6 +136,9 @@ inline std::size_t parseLayoutOverrides(std::string_view text, LayoutOverrides& 
                                         LayoutParseReport* report = nullptr) noexcept {
     out.count = 0;
     EngineLayout* current = nullptr;
+    // A row that contained any invalid recognized value is rejected as a whole:
+    // a partially applied override must never shadow a built-in row.
+    bool invalid[LayoutOverrides::capacity]{};
     while (!text.empty()) {
         auto end = text.find('\n');
         auto line = detail::trim(text.substr(0, end));
@@ -171,24 +174,29 @@ inline std::size_t parseLayoutOverrides(std::string_view text, LayoutOverrides& 
             *current = EngineLayout{};
             current->runtime = static_cast<std::uint32_t>(runtime);
             current->evidence = "runtime override from FreezeSentryF4.layout.ini";
+            invalid[out.count] = false;
             ++out.count;
             continue;
         }
         if (!current) continue;
+        const auto rowIndex = static_cast<std::size_t>(current - out.rows);
         auto equals = line.find('=');
         if (equals == std::string_view::npos) {
+            invalid[rowIndex] = true;
             if (report) report->note("malformed entry");
             continue;
         }
         auto key = detail::trim(line.substr(0, equals));
         std::uint64_t value = 0;
         if (!detail::parseHex(line.substr(equals + 1), value)) {
+            invalid[rowIndex] = true;
             if (report) { ++report->invalidValues; report->note("invalid or overflowing hex value"); }
             continue;
         }
         auto field = [&](std::string_view name, std::uint32_t& target, std::uint32_t maximum) {
             if (key != name) return false;
             if (value > maximum) {
+                invalid[rowIndex] = true;
                 if (report) { ++report->invalidValues; report->note("value exceeds field width"); }
                 return true;
             }
@@ -198,6 +206,7 @@ inline std::size_t parseLayoutOverrides(std::string_view text, LayoutOverrides& 
         auto wide = [&](std::string_view name, std::uint64_t& target, std::uint64_t maximum) {
             if (key != name) return false;
             if (value > maximum) {
+                invalid[rowIndex] = true;
                 if (report) { ++report->invalidValues; report->note("value exceeds field width"); }
                 return true;
             }
@@ -228,6 +237,10 @@ inline std::size_t parseLayoutOverrides(std::string_view text, LayoutOverrides& 
     std::size_t kept = 0;
     for (std::size_t i = 0; i < out.count; ++i) {
         const auto& row = out.rows[i];
+        if (invalid[i]) {
+            if (report) report->note("override row rejected after an invalid field");
+            continue;
+        }
         if (hasPlayer(row) || hasMenus(row)) out.rows[kept++] = row;
         else if (report) report->note("override row cannot decode either half");
     }

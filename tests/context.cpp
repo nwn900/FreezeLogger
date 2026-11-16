@@ -90,6 +90,39 @@ int main() {
     check(fs::resolveLayout(0x010A0A30, &partialOverride) == modern,
           "rejected partial override leaves the built-in row active");
 
+    // A complete override for a built-in runtime with one invalid recognized
+    // field is rejected as a whole and cannot shadow the built-in row.
+    fs::LayoutOverrides invalidCell;
+    fs::LayoutParseReport invalidCellReport;
+    check(fs::parseLayoutOverrides(
+              "[Layout.010A0A30]\nPlayerRva=0x1111\nUiRva=0x2222\nPlayerCellOffset=0xB8\n"
+              "CellFormIdOffset=0x14\nCellTypeOffset=0x1A\nCellNameOffset=0x1000000B8\n",
+              invalidCell, &invalidCellReport) == 0 && invalidCellReport.rejected >= 1,
+          "complete override with one invalid recognized cell field is rejected as a whole");
+    check(fs::resolveLayout(0x010A0A30, &invalidCell) == modern,
+          "invalid complete override cannot shadow the built-in row");
+    fs::LayoutOverrides invalidMenu;
+    fs::LayoutParseReport invalidMenuReport;
+    check(fs::parseLayoutOverrides(
+              "[Layout.010A0A30]\nPlayerRva=0x1111\nUiRva=0x2222\nPlayerCellOffset=0xB8\n"
+              "CellFormIdOffset=0x14\nCellTypeOffset=0x1A\nUiStackOffset=0x190\nUiTableOffset=0x1B0\n"
+              "UiTableEntriesOffset=0x20\nMenuStride=0x28\nMenuNameOffset=0x1000000B8\n"
+              "MenuInstanceOffset=0x10\nMenuNextOffset=0x20\n",
+              invalidMenu, &invalidMenuReport) == 0 && invalidMenuReport.rejected >= 1,
+          "invalid menu name offset rejects the whole row");
+    check(fs::resolveLayout(0x010A0A30, &invalidMenu) == modern,
+          "invalid menu override cannot shadow the built-in row");
+
+    // A deliberately partial but valid row stays supported.
+    fs::LayoutOverrides playerOnly;
+    fs::LayoutParseReport playerOnlyReport;
+    check(fs::parseLayoutOverrides(
+              "[Layout.010C0000]\nPlayerRva=0x1111\nPlayerCellOffset=0xB8\n"
+              "CellFormIdOffset=0x14\nCellTypeOffset=0x1A\n",
+              playerOnly, &playerOnlyReport) == 1 && fs::hasPlayer(playerOnly.rows[0]) &&
+          !fs::hasMenus(playerOnly.rows[0]),
+          "deliberately partial valid row is still accepted");
+
     // Duplicate sections are rejected and counted.
     fs::LayoutOverrides duplicate;
     fs::LayoutParseReport duplicateReport;
