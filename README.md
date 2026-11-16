@@ -3,10 +3,10 @@
 Original Fallout 4 F4SE freeze logger: a small DLL plus a separate Windows
 collector. The DLL uses public F4SE interfaces; no Address Library, CommonLib
 or game memory patches. A separately gated collector adapter reads engine
-context only from a qualified 1.10.163 executable.
+context only from a qualified 1.10.163 or 1.11.221 executable.
 
-Version 0.3.6 adds a live crash minidump on fatal exceptions and raises the
-loading hang threshold from observed
+Version 0.3.6 adds an opt-in live crash minidump on fatal exceptions
+(`WriteMinidump=0` by default) and raises the loading hang threshold from observed
 load times. Version 0.3.5 closes crash-log chronology (exception must precede log write within
 limits), samples the frame provider immediately before the frame stall decision, verifies
 matching PDB identities in diagnostic packages, and retains the 0.3.3 frame,
@@ -31,8 +31,9 @@ has no visible window and exits when the game exits.
 
 ## Collected evidence
 
-Each incident contains three independent process snapshots and, by default,
-a snapshot minidump. Collection pauses one second between passes and records
+Each incident contains three independent process snapshots and, when
+`WriteMinidump=1` is set (opt-in), a snapshot minidump. Collection pauses one
+second between passes and records
 each actual sample time; dump writing and symbol processing can lengthen the
 interval, particularly with full-memory dumps.
 
@@ -122,23 +123,30 @@ I/O. Inline UTF-8 fields must be terminated, with version=1 and size=384.
 
 An adapter must identify its source and copy validated FormIDs, cell/menu names
 and plugin filenames under its own runtime/lifetime contract. The logger does
-not infer a winning override from a FormID prefix. The collector bundles a
-read-only adapter for an exactly qualified 1.10.163 image; other runtimes retain
-public F4SE/provider history. Scaleform creation reports an opaque movie address,
+not infer a winning override from a FormID prefix. The collector bundles
+read-only layout rows for 1.10.163 and 1.11.221; other runtimes retain public
+F4SE/provider history. Scaleform creation reports an opaque movie address,
 not a named menu or its lifetime. `FramePulse` is for a validated per-frame source,
-not a timer; it takes precedence over ETW. `FrameMonitoring=0` disables automatic
-frame-silence reports. Adapter events supplement evidence, not a culprit verdict.
+not a timer; it takes precedence over ETW while it is fresh. `FrameMonitoring=0`
+disables automatic frame-silence reports. Adapter events supplement evidence,
+not a culprit verdict.
 
 `ContextMonitoring=1` polls current cell/FormID/name, associated ESP/ESL files
-and the active menu stack about every 500 ms. The adapter requires the exact
-on-disk executable hash, matching loaded PE identity and readable data globals;
-unknown versions/images are skipped. Two equal reads, bounded arrays/strings,
+and the active menu stack about every 500 ms. A built-in row is enabled only
+when the on-disk executable hash matches the row's fingerprint and the derived
+globals land in readable, non-executable image data; a hash mismatch is
+**unqualified** and disables the adapter instead of enabling it with a warning.
+Rows supplied through `FreezeSentryF4.layout.ini` are opt-in and structural-only
+(no fingerprint), and every row is validated before it can replace a built-in.
+Unknown versions/images are skipped. Two equal reads, bounded arrays/strings,
 vtable/type checks and ReadProcessMemory failures discard unreadable samples.
 This is not an atomic snapshot: short transitions can be missed. Last readable
 fields retain their independent timestamps when current context is unavailable.
 LoadingMenu means observed loading, not confirmed fast travel. The associated
-file list is not a winning override or culprit verdict. See
-[adapter qualification](docs/CONTEXT-163.md).
+file list is not a winning override or culprit verdict. The 1.11.221 row's UI
+table/entry shape was inferred from member constructors rather than checked
+against a live image, so treat its menu half as lower-confidence than the
+1.10.163 row. See [adapter qualification](docs/CONTEXT-163.md).
 
 `CaptureTimeoutSeconds=120` limits a full collector operation (15..900 seconds).
 Raise it explicitly for very large full dumps. A separate thread limits blocked

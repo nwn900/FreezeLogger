@@ -211,7 +211,8 @@ bool load(const fs::Host* host) {
     state->maxManualReports = setting(ini, L"MaxManualReports", state->maxReports, 1, 100);
     state->suppressBackground = setting(ini, L"SuppressBackgroundHang", 1, 0, 1);
     state->foregroundGraceSec = setting(ini, L"ForegroundGraceSeconds", 10, 0, 300);
-    state->writeDump = setting(ini, L"WriteMinidump", 1, 0, 1);
+    // Minidumps are opt-in: text/thread evidence is the default incident payload.
+    state->writeDump = setting(ini, L"WriteMinidump", 0, 0, 1);
     state->fullDump = setting(ini, L"FullMemoryDump", 0, 0, 1);
     state->earlyMs = setting(ini, L"EarlyWarningSeconds", 3, 0, 60) * 1000;
     state->profileMs = setting(ini, L"ProfileMilliseconds", 2000, 500, 10000);
