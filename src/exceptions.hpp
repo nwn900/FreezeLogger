@@ -7,6 +7,9 @@
 #include <vector>
 
 namespace fs {
+// Test-only hook: called between the throw-record field writes so a regression
+// test can widen the publication window. Null in production.
+inline void (*cppThrowTestHook)() = nullptr;
 struct KeptFault {
     bool present = false;
     DWORD code = 0, thread = 0;
@@ -181,16 +184,20 @@ private:
         slot.data.stackBytes = static_cast<DWORD>(bytes);
         InterlockedIncrement(&slot.sequence);
         InterlockedExchange64(&state_->faultCount, ordinal);
-        InterlockedExchange(&state_->faultWriting, 0);
         if (code == 0xE06D7363u) {
-            // Coherent, race-free publication of the last handled C++ throw.
+            // Single writer: faultWriting is still held here, so two exception
+            // callbacks cannot interleave the record's fields. The generation
+            // pair keeps the lock-free abort reader coherent.
             InterlockedIncrement64(&cppThrow_.generation);
             InterlockedExchange64(&cppThrow_.tick, slot.data.tick);
             InterlockedExchange64(&cppThrow_.address, slot.data.ip);
             InterlockedExchange(&cppThrow_.thread, static_cast<LONG>(GetCurrentThreadId()));
+            if (cppThrowTestHook) cppThrowTestHook();
             MemoryBarrier();
             InterlockedIncrement64(&cppThrow_.generation);
-        } else if (isFatalExceptionCode(code)) {
+        }
+        InterlockedExchange(&state_->faultWriting, 0);
+        if (code != 0xE06D7363u && isFatalExceptionCode(code)) {
             // First chance only: SEH may still handle this. Breadcrumb it as a
             // provisional observation; the terminal slot is consumed only by the
             // unhandled filter or the abort handler.

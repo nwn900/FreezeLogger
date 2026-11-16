@@ -1,6 +1,7 @@
 #include "../src/exceptions.hpp"
 #include <windows.h>
 #include <array>
+#include <atomic>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -54,6 +55,15 @@ int terminalChild(const wchar_t* mappingName, const wchar_t* marker, const wchar
     }
     RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr); // unhandled: terminal
     return 5; // not reached
+}
+
+std::atomic<int> hookInside{0}, hookMax{0};
+void throwHook() {
+    int now = hookInside.fetch_add(1) + 1;
+    int previous = hookMax.load();
+    while (now > previous && !hookMax.compare_exchange_weak(previous, now)) {}
+    Sleep(1);
+    hookInside.fetch_sub(1);
 }
 
 bool runTerminalChild(const wchar_t* order) {
@@ -176,6 +186,28 @@ int wmain(int argc, wchar_t** argv) {
         fs::ExceptionJournal::abortSignal(SIGABRT);
         check(fs::read(shared.crashSequence) == 0,
               "a throw on another thread cannot be combined with this thread's abort");
+    }
+
+    // Concurrent writers: the throw record is single-writer. The test hook
+    // widens the publication window, so at most one writer may be inside it and
+    // an abort on another thread must never combine fields from two throws.
+    {
+        fs::Shared shared{};
+        fs::ExceptionJournal journal(&shared);
+        check(journal.install(&shared), "journal installs for concurrency test");
+        hookInside = 0; hookMax = 0;
+        fs::cppThrowTestHook = throwHook;
+        std::thread aborter([&] {
+            for (int i = 0; i < 200; ++i) { fs::ExceptionJournal::abortSignal(SIGABRT); Sleep(1); }
+        });
+        std::vector<std::thread> throwers;
+        for (int i = 0; i < 4; ++i) throwers.emplace_back(handledCppThrow);
+        for (auto& thread : throwers) thread.join();
+        aborter.join();
+        fs::cppThrowTestHook = nullptr;
+        check(hookMax.load() == 1, "throw-record publication is single-writer under contention");
+        check(fs::read(shared.crashSequence) == 0,
+              "a concurrent throw on another thread cannot be combined with this thread's abort");
     }
 
     // A real unhandled fault in a controlled child process still produces one
