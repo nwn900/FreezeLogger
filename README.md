@@ -15,17 +15,6 @@ matching exception and loaded-module evidence only corroborate a log and do not
 prove which overlapping same-version process wrote it. See
 [validation](docs/VALIDATION.md) for evidence and limits.
 
-## Renamed from FreezeSentryF4
-
-The mod is now **Freeze Logger**: `FreezeLogger.dll`, `FreezeLoggerWatch.exe`,
-`FreezeLogger.ini`, and the `FreezeLogger` report folder. Existing installs
-keep working: the plugin still reads a legacy `FreezeSentryF4.ini` and
-`[FreezeSentryF4]` section when the new names are absent, keeps using an
-existing `.../F4SE/FreezeSentryF4` report folder, and the old
-`FreezeSentryF4_RecordEvent` / `FreezeSentryF4_FramePulse` exports remain as
-aliases. Remove the old DLL, EXE and INI when upgrading so F4SE does not load
-both plugins.
-
 ## Install
 
 Install the package through Vortex/MO2, or copy its `F4SE/Plugins` folder into
