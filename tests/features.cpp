@@ -167,6 +167,58 @@ int wmain(int argc, wchar_t** argv) {
             auto later = stoppedSelector.select(qualifiedNative.snapshot(), qualifiedEtw.snapshot(), true, 20000);
             check(later.source == 1 && later.sample.tick == 1000, "stopped ETW keeps its last present time");
         }
+        // Handover must not backdate progress: native presented at 20 s, a
+        // once-qualified ETW is stalled at 1 s. The gate must wait a full
+        // timeout from the newer progress, not fire immediately.
+        auto handoverFrame = [](LONG source, LONG64 tick, LONG64 count) {
+            fs::FrameSnapshot sample{tick, tick, count, 1, count != 0};
+            return fs::FrameSelection{sample, source};
+        };
+        {
+            fs::FrameGate progressGate;
+            auto nativeProgress = handoverFrame(2, 20000, 100);
+            auto staleEtw = handoverFrame(1, 1000, 50);
+            check(!progressGate.sample(20000, nativeProgress, true, false, 15000), "native progress arms");
+            check(!progressGate.sample(22001, staleEtw, true, false, 15000),
+                  "stale ETW handover does not backdate progress");
+            check(!progressGate.sample(22201, staleEtw, true, false, 15000),
+                  "no false report before the threshold");
+            check(!progressGate.sample(34999, staleEtw, true, false, 15000), "still below the threshold");
+            check(progressGate.sample(35000, staleEtw, true, false, 15000), "reports once at the threshold");
+            check(!progressGate.sample(35200, staleEtw, true, false, 15000), "no duplicate report");
+        }
+        // Reverse: the fallback is newer than the native sample.
+        {
+            fs::FrameGate reverseGate;
+            auto staleNativeSample = handoverFrame(2, 1000, 100);
+            auto freshEtw = handoverFrame(1, 20000, 50);
+            check(!reverseGate.sample(20000, staleNativeSample, true, false, 15000), "stale native arms");
+            check(!reverseGate.sample(22001, freshEtw, true, false, 15000), "fresh ETW handover adopts newer progress");
+            check(!reverseGate.sample(34999, freshEtw, true, false, 15000), "fresh ETW progress is not backdated");
+            check(reverseGate.sample(35000, freshEtw, true, false, 15000),
+                  "stall reports at the threshold from the newer progress");
+        }
+        // Equal-tick both-frozen handover still reports at the threshold.
+        {
+            fs::FrameGate equalGate;
+            auto frozenA = handoverFrame(2, 1000, 100);
+            auto frozenB = handoverFrame(1, 1000, 50);
+            check(!equalGate.sample(1000, frozenA, true, false, 15000), "frozen native arms");
+            check(!equalGate.sample(3001, frozenB, true, false, 15000), "equal-tick handover does not report immediately");
+            check(equalGate.sample(16001, frozenB, true, false, 15000), "equal-tick both-frozen reports at the threshold");
+            check(!equalGate.sample(17000, handoverFrame(1, 16900, 51), true, false, 15000), "ETW recovery rearms");
+            check(equalGate.sample(32000, handoverFrame(1, 16900, 51), true, false, 15000), "second stall reports after recovery");
+        }
+        // A 30 s deadline uses the same preserved progress.
+        {
+            fs::FrameGate slowProgressGate;
+            auto nativeProgress = handoverFrame(2, 20000, 100);
+            auto staleEtw = handoverFrame(1, 1000, 50);
+            check(!slowProgressGate.sample(20000, nativeProgress, true, false, 30000), "slow gate arms");
+            check(!slowProgressGate.sample(22001, staleEtw, true, false, 30000), "slow handover preserves progress");
+            check(!slowProgressGate.sample(49999, staleEtw, true, false, 30000), "slow gate waits for 30 s");
+            check(slowProgressGate.sample(50000, staleEtw, true, false, 30000), "slow gate reports at 30 s");
+        }
         LONG64 eventTick = 0;
         check(fs::frameTickFromQpc(100000, 200000, 1000000, 10000, eventTick) && eventTick == 9900,
               "ETW presentation timestamp maps from QPC to monotonic milliseconds");

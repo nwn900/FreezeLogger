@@ -95,9 +95,10 @@ public:
                         sample.count >= FrameProviderSelector::minimumFrames && foreground && !loading;
         if (!eligible) { reset(); return false; }
         if (sample.tick > now) return false;
-        if (!active_ || sample.count < lastCount_) {
-            // First eligibility or a source restart: pre-eligibility buffered
-            // ticks are not evidence of post-eligibility progress.
+        const bool sourceChanged = active_ && source_ != selection.source;
+        if (!active_ || (sample.count < lastCount_ && !sourceChanged)) {
+            // First eligibility or a same-source counter restart: pre-eligibility
+            // buffered ticks are not evidence of post-eligibility progress.
             active_ = true;
             source_ = selection.source;
             eligibleSince_ = lastProgress_ = now;
@@ -105,15 +106,15 @@ public:
             gate_.rearm();
             return false;
         }
-        if (source_ != selection.source) {
-            // Handover between healthy sources: rebase on the new source's own
-            // last present time, so an equally frozen fallback cannot mask the
-            // stall for a full timeout.
+        if (sourceChanged) {
+            // Handover: preserve the most recent trustworthy progress across
+            // providers. A fallback whose newest buffered tick is old must not
+            // backdate progress that was already observed, and an old-source
+            // selection must not clear an incident's recovery requirement.
             source_ = selection.source;
-            const LONG64 baseline = sample.tick > 0 && sample.tick <= now ? sample.tick : now;
-            eligibleSince_ = lastProgress_ = baseline;
+            const LONG64 observed = sample.tick > 0 && sample.tick <= now ? sample.tick : now;
+            if (observed > lastProgress_) lastProgress_ = observed;
             lastCount_ = sample.count;
-            gate_.rearm();
             return false;
         }
         if (sample.count > lastCount_) {
