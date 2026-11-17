@@ -9,7 +9,7 @@ part of this port. Shared memory is version 8.
 
 ## Freeze Logger 0.3.5 audit follow-up, 2026-11-07
 
-[GitHub issue #1](https://github.com/nwn900/FreezeSentryF4/issues/1) third-audit
+[GitHub issue #1](https://github.com/nwn900/FreezeLogger/issues/1) third-audit
 follow-up: incident corroboration now rejects a log written a full minute
 before the matching in-process exception (only a small last-write skew toward a
 later exception remains for FAT-style timestamp quantization). The watcher takes
