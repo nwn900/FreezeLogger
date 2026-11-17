@@ -39,7 +39,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     auto* state = static_cast<fs::Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(fs::Shared)));
     if (!state) return 3;
     struct Unmap { void* p; ~Unmap() { UnmapViewOfFile(p); } } unmap{state};
-    if (state->signature != fs::magic || state->version != 9 || !state->pid ||
+    if (state->signature != fs::magic || state->version != 10 || !state->pid ||
         state->timeoutMs < 2000 || state->timeoutMs > 3600000 ||
         state->loadingMs < 2000 || state->loadingMs > 3600000 ||
         state->startupMs < 2000 || state->startupMs > 3600000 ||
@@ -121,7 +121,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             std::ofstream preflight(folder / ("preflight-" + std::to_string(state->pid) + ".json"), std::ios::trunc);
             preflight << "{\n"
                       << "  \"tool\": \"FreezeSentryF4 " << fs::toolVersion << "\",\n"
-                      << "  \"shared_version\": 9,\n"
+                      << "  \"shared_version\": 10,\n"
                       << "  \"game_image\": \"" << fs::jsonEscape(fs::diagnosticPath(gameImage)) << "\",\n"
                       << "  \"pid\": " << state->pid << ",\n"
                       << "  \"runtime\": " << state->runtime << ",\n"

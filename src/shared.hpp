@@ -126,7 +126,7 @@ private:
     alignas(8) volatile LONG64 tick_ = 0, receivedTick_ = 0, count_ = 0;
 };
 struct alignas(8) Shared {
-    LONG signature = magic, version = 9;
+    LONG signature = magic, version = 10;
     DWORD pid = 0, runtime = 0, extender = 0;
     DWORD timeoutMs = 15000, loadingMs = 120000, startupMs = 180000, probeMs = 250;
     DWORD maxReports = 10, writeDump = 0, manualKey = VK_PAUSE;
