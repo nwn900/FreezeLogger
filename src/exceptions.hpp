@@ -271,7 +271,18 @@ public:
             }
         }
         auto previous = previousAbort_;
-        if (previous && previous != SIG_DFL && previous != SIG_IGN) previous(signalNumber);
+        if (previous && previous != SIG_DFL && previous != SIG_IGN) {
+            previous(signalNumber);
+            return;
+        }
+        if (previous == SIG_IGN) return; // originally ignored: preserve that
+        // Original disposition was SIG_DFL (or unknown). A direct raise(SIGABRT)
+        // must still take the default fatal path: restore the default and
+        // re-raise. abort() terminates even if a handler returns, so this only
+        // restores the documented raise() behavior. The observer never prevents
+        // expected termination.
+        std::signal(SIGABRT, SIG_DFL);
+        std::raise(SIGABRT);
     }
 
 private:

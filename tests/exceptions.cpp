@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -64,6 +65,68 @@ int terminalChild(const wchar_t* mappingName, const wchar_t* marker, const wchar
     return 5; // not reached
 }
 
+void noopAbort(int) {}
+std::wstring abortMarkerPath;
+void customAbort(int) {
+    HANDLE marker = CreateFileW(abortMarkerPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (marker != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(marker, "called", 6, &written, nullptr);
+        CloseHandle(marker);
+    }
+}
+
+int abortChild(const wchar_t* mappingName, const wchar_t* mode, const wchar_t* marker) {
+    abortMarkerPath = marker;
+    fs::Handle mapping(OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, mappingName));
+    if (!mapping.value) return 2;
+    auto* shared = static_cast<fs::Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(fs::Shared)));
+    if (!shared) return 3;
+    std::wstring disposition(mode);
+    if (disposition == L"ignore") std::signal(SIGABRT, SIG_IGN);
+    else if (disposition == L"custom") std::signal(SIGABRT, customAbort);
+    fs::ExceptionJournal journal(shared);
+    if (!journal.install(shared)) return 4;
+    if (disposition == L"throw-abort") {
+        handledCppThrow();
+        std::abort();
+    }
+    if (disposition == L"abort") std::abort();
+    std::raise(SIGABRT);
+    return 0; // reached only for an ignored or custom disposition
+}
+
+bool runAbortChild(const wchar_t* mode, DWORD expectedExit, bool expectCrash) {
+    auto name = L"Local\\FSF4-abort-" + std::to_wstring(GetCurrentProcessId()) + L"-" + mode;
+    auto marker = std::filesystem::current_path() / (std::wstring(L"abort-marker-") + mode + L".txt");
+    std::error_code ignored; std::filesystem::remove(marker, ignored);
+    fs::Handle mapping(CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(fs::Shared), name.c_str()));
+    if (!mapping.value) return false;
+    auto* shared = static_cast<fs::Shared*>(MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(fs::Shared)));
+    if (!shared) return false;
+    new (shared) fs::Shared;
+    std::array<wchar_t, 32768> exe{};
+    DWORD length = GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+    if (!length || length >= exe.size()) return false;
+    std::wstring command = L"\"" + std::wstring(exe.data(), length) + L"\" --abort-child \"" + name +
+        L"\" " + mode + L" \"" + marker.wstring() + L"\"";
+    STARTUPINFOW startup{}; startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    bool started = CreateProcessW(exe.data(), command.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &startup, &process) != FALSE;
+    if (!started) return false;
+    WaitForSingleObject(process.hProcess, 15000);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    bool crash = fs::read(shared->crashSequence) == 2;
+    bool markerWritten = std::filesystem::exists(marker);
+    UnmapViewOfFile(shared);
+    if (exitCode != expectedExit || crash != expectCrash) return false;
+    if (std::wstring(mode) == L"custom" && !markerWritten) return false;
+    return true;
+}
+
 std::atomic<int> hookInside{0}, hookMax{0};
 void throwHook() {
     int now = hookInside.fetch_add(1) + 1;
@@ -106,6 +169,11 @@ bool runTerminalChild(const wchar_t* order) {
 int wmain(int argc, wchar_t** argv) {
     if (argc == 5 && std::wstring(argv[1]) == L"--terminal-child")
         return terminalChild(argv[2], argv[3], argv[4]);
+    if (argc == 5 && std::wstring(argv[1]) == L"--abort-child")
+        return abortChild(argv[2], argv[3], argv[4]);
+    // Direct abortSignal tests must not terminate the test process: install a
+    // no-op handler before the first journal captures the disposition.
+    std::signal(SIGABRT, noopAbort);
 
     {
         fs::Shared shared{};
@@ -263,6 +331,13 @@ int wmain(int argc, wchar_t** argv) {
         check(fs::read(shared.crashSequence) == 0,
               "a concurrent throw on another thread cannot be combined with this thread's abort");
     }
+
+    // SIGABRT semantics: the observer must not consume the default fatal path.
+    check(runAbortChild(L"default", 3, false), "raise(SIGABRT) with SIG_DFL still terminates");
+    check(runAbortChild(L"ignore", 0, false), "an ignored SIGABRT stays ignored");
+    check(runAbortChild(L"custom", 0, false), "a custom SIGABRT handler is called and may return");
+    check(runAbortChild(L"abort", 3, false), "abort() still terminates");
+    check(runAbortChild(L"throw-abort", 3, true), "abort after a handled throw publishes and terminates");
 
     // A real unhandled fault in a controlled child process still produces one
     // terminal incident, in both crash-handler registration orders.
