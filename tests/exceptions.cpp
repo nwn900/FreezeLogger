@@ -98,7 +98,7 @@ int abortChild(const wchar_t* mappingName, const wchar_t* mode, const wchar_t* m
 
 bool runAbortChild(const wchar_t* mode, DWORD expectedExit, bool expectCrash) {
     auto name = L"Local\\FSF4-abort-" + std::to_wstring(GetCurrentProcessId()) + L"-" + mode;
-    auto marker = std::filesystem::current_path() / (std::wstring(L"abort-marker-") + mode + L".txt");
+    auto marker = std::filesystem::temp_directory_path() / (std::wstring(L"abort-marker-") + mode + L".txt");
     std::error_code ignored; std::filesystem::remove(marker, ignored);
     fs::Handle mapping(CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(fs::Shared), name.c_str()));
     if (!mapping.value) return false;
@@ -144,7 +144,7 @@ void throwHook() {
 
 bool runTerminalChild(const wchar_t* order) {
     auto name = L"Local\\FSF4-terminal-" + std::to_wstring(GetCurrentProcessId()) + L"-" + order;
-    auto marker = std::filesystem::current_path() / (std::wstring(L"terminal-marker-") + order + L".txt");
+    auto marker = std::filesystem::temp_directory_path() / (std::wstring(L"terminal-marker-") + order + L".txt");
     std::error_code ignored; std::filesystem::remove(marker, ignored);
     fs::Handle mapping(CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(fs::Shared), name.c_str()));
     if (!mapping.value) return false;
