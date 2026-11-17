@@ -79,17 +79,47 @@ def build_configuration(build: Path, config: str) -> None:
     subprocess.run(["cmake", "--build", str(build), "--config", config, "--parallel"], check=True)
 
 
+PACKAGED_DIRECTORIES = ("src", "tests", "docs", "dist", "scripts", "fuzz", "tools")
+PACKAGED_ROOT_FILES = (".gitignore", "CMakeLists.txt", "README.md", "LICENSE")
+
+
+def packaged_status_lines(status: str) -> list[str]:
+    """Porcelain lines for files that would enter the source archive."""
+    lines = []
+    for line in status.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        if path in PACKAGED_ROOT_FILES or path.split("/", 1)[0] in PACKAGED_DIRECTORIES:
+            lines.append(line)
+    return lines
+
+
 def source_manifest() -> dict:
-    """Immutable source revision and dirty state for the release receipt."""
+    """Immutable source revision and dirty state for the release receipt.
+
+    Untracked files under packaged directories are included: the source archive
+    is built with rglob, so a clean HEAD alone would misrepresent the archive.
+    """
     def git(*arguments: str) -> str:
         return subprocess.run(["git", *arguments], cwd=ROOT, capture_output=True, text=True,
-                              check=True).stdout.strip()
+                              check=True).stdout
     try:
-        commit = git("rev-parse", "HEAD")
-        dirty = git("status", "--porcelain", "--untracked-files=no")
+        commit = git("rev-parse", "HEAD").strip()
+        packaged = packaged_status_lines(git("status", "--porcelain"))
     except (subprocess.CalledProcessError, FileNotFoundError):
         return {"commit": "unavailable", "dirty": None, "dirty_paths": []}
-    return {"commit": commit, "dirty": bool(dirty), "dirty_paths": dirty.splitlines()[:20]}
+    return {"commit": commit, "dirty": bool(packaged), "dirty_paths": packaged[:20]}
+
+
+def archive_manifest_digest(archive: Path) -> str:
+    """Digest of the complete source archive manifest (path + content hash)."""
+    with zipfile.ZipFile(archive) as source:
+        lines = [f"{hashlib.sha256(source.read(name)).hexdigest()}  {name}"
+                 for name in sorted(source.namelist())]
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
 def stale_receipt(report: Path, inputs: list[Path]) -> Path | None:
@@ -171,6 +201,9 @@ def main() -> int:
     required(configured_symbols.group(1) == args.symbols_mode,
              f"package symbols mode {args.symbols_mode} differs from CMake mode {configured_symbols.group(1)}")
     generator = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.+)$", cache, re.M)
+    home = re.search(r"^CMAKE_HOME_DIRECTORY:INTERNAL=(.+)$", cache, re.M)
+    required(home is not None and Path(home.group(1)).resolve() == ROOT.resolve(),
+             f"build tree {build} was configured for {home.group(1) if home else 'unknown'}, not {ROOT}")
 
     # Binaries must be built from the source that is about to be archived: a
     # source edit after the last build must not ship with stale executables.
@@ -296,6 +329,7 @@ def main() -> int:
         receipt = {
             "version": VERSION,
             "source": source_manifest(),
+            "source_archive_manifest_sha256": archive_manifest_digest(source),
             "build": {
                 "generator": generator.group(1) if generator else "unknown",
                 "config": args.config,

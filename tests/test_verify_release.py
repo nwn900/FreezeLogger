@@ -258,6 +258,25 @@ class PackageProvenanceTests(unittest.TestCase):
         self.assertIn("plugin.cpp", names)
         self.assertIn("frames.hpp", names)
 
+    def test_untracked_packaged_file_marks_dirty(self):
+        status = "?? src/new.cpp\n?? .cursor/state.json\n M tests/test.cpp\n?? docs/notes.md\n"
+        lines = package.packaged_status_lines(status)
+        self.assertIn("?? src/new.cpp", lines)
+        self.assertIn(" M tests/test.cpp", lines)
+        self.assertIn("?? docs/notes.md", lines)
+        self.assertNotIn("?? .cursor/state.json", lines)
+
+    def test_archive_manifest_digest_is_stable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "source.zip"
+            with zipfile.ZipFile(archive, "w") as source:
+                source.writestr("a.txt", "a")
+                source.writestr("b.txt", "b")
+            first = package.archive_manifest_digest(archive)
+            second = package.archive_manifest_digest(archive)
+            self.assertEqual(first, second)
+            self.assertEqual(len(first), 64)
+
 
 if __name__ == "__main__":
     unittest.main()
