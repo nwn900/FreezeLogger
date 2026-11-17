@@ -47,7 +47,11 @@ int wmain(int argc, wchar_t** argv) {
     writeIni(reportDirectory);
     check(load(&host), "corrected initialization can retry after pre-registration failures");
     check(!load(&host), "registered plugin cannot start another monitor");
-    auto preflight = reportDirectory / ("preflight-" + std::to_string(GetCurrentProcessId()) + ".json");
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user);
+    const auto created = (static_cast<long long>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+    auto preflight = reportDirectory / (L"preflight-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                                        std::to_wstring(created) + L".json");
     auto deadline = GetTickCount64() + 5000;
     while (!std::filesystem::exists(preflight) && GetTickCount64() < deadline) Sleep(50);
     std::ifstream receipt(preflight);

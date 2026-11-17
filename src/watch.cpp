@@ -66,8 +66,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         bool vr = _wcsicmp(image.c_str(), L"Fallout4VR.exe") == 0;
         auto folder = state->outputDirectory[0] ? std::filesystem::path(state->outputDirectory) : fs::reportRoot(vr);
         std::filesystem::create_directories(folder);
-        auto sessionPath = folder / ("session-" + std::to_string(state->pid) + ".log");
-        auto historyPath = folder / ("prehang-" + std::to_string(state->pid) + ".log");
+        const auto sessionKey = fs::sessionId(state->pid, fs::read(state->processCreated));
+        auto sessionPath = folder / (L"session-" + sessionKey + L".log");
+        auto historyPath = folder / (L"prehang-" + sessionKey + L".log");
         std::ofstream session(sessionPath, std::ios::trunc);
         if (gameImageQueryError)
             session << "game_image_query_error=" << gameImageQueryError << "; external crash logs will not be attributed\n";
@@ -118,12 +119,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             MEMORYSTATUSEX memory{};
             memory.dwLength = sizeof(memory);
             GlobalMemoryStatusEx(&memory);
-            std::ofstream preflight(folder / ("preflight-" + std::to_string(state->pid) + ".json"), std::ios::trunc);
+            std::ofstream preflight(folder / (L"preflight-" + sessionKey + L".json"), std::ios::trunc);
             preflight << "{\n"
                       << "  \"tool\": \"FreezeSentryF4 " << fs::toolVersion << "\",\n"
                       << "  \"shared_version\": 10,\n"
                       << "  \"game_image\": \"" << fs::jsonEscape(fs::diagnosticPath(gameImage)) << "\",\n"
                       << "  \"pid\": " << state->pid << ",\n"
+                      << "  \"session\": \"" << fs::diagnosticUtf8(sessionKey) << "\",\n"
+                      << "  \"process_created\": " << fs::read(state->processCreated) << ",\n"
                       << "  \"runtime\": " << state->runtime << ",\n"
                       << "  \"extender\": " << state->extender << ",\n"
                       << "  \"timeout_ms\": " << state->timeoutMs << ",\n"
@@ -247,8 +250,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                     session.flush();
                     InterlockedExchange(&state->crashCaptureState, 2); // capture attempted
                     auto result = collect("fatal-exception");
+                    // Text and dump are independent outcomes: a validated dump
+                    // must never be labelled a failed capture because the text
+                    // stream failed.
                     LONG captureState = -1;
-                    if (result.textComplete) captureState = result.dumpValidated ? 4 : 3;
+                    if (result.dumpValidated) captureState = result.textComplete ? 4 : 5; // 5 = dump-only
+                    else if (result.textComplete) captureState = 3;
+                    else if (result.dumpRequested) captureState = 2;
                     InterlockedExchange(&state->crashCaptureState, captureState);
                     session << "crash_capture_state=" << captureState << " text_complete=" << result.textComplete
                             << " dump_validated=" << result.dumpValidated << '\n';
@@ -269,7 +277,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                     session << "process_exit_code_query_error=" << GetLastError() << '\n';
                 persistHistory();
                 if (fs::read(state->faultCount) || !exitCodeKnown || exitCode != 0) {
-                    std::ofstream evidence(folder / ("exit-evidence-" + std::to_string(state->pid) + ".log"));
+                    std::ofstream evidence(folder / (L"exit-evidence-" + sessionKey + L".log"));
                     if (!evidence) {
                         session << "exit_evidence_write_failed\n";
                         session.flush();
@@ -392,12 +400,19 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             }
             LONG provisional = fs::read(state->provisionalCount);
             if (provisional != lastProvisional) {
-                session << "tick=" << t << " provisional_fatal_observation code=0x" << std::hex << state->provisionalCode
-                        << std::dec << " thread=" << state->provisionalThread << " address=0x" << std::hex
-                        << state->provisionalAddress << std::dec << " count=" << provisional
-                        << " (first chance; may have been handled; terminal capture not consumed)\n";
-                session.flush();
-                lastProvisional = provisional;
+                auto snapshot = fs::snapshotProvisional(*state);
+                if (snapshot.valid) {
+                    session << "tick=" << t << " provisional_fatal_observation code=0x" << std::hex << snapshot.code
+                            << std::dec << " thread=" << snapshot.thread << " address=0x" << std::hex
+                            << snapshot.address << std::dec << " count=" << snapshot.count
+                            << " observed_tick=" << snapshot.tick
+                            << " (first chance; may have been handled; terminal capture not consumed)\n";
+                    session.flush();
+                    lastProvisional = snapshot.count;
+                } else {
+                    session << "tick=" << t << " provisional_observation_busy; retry next poll\n";
+                    session.flush();
+                }
             }
             // System sleep and a paused debugger can suspend the observer too.
             if (t - lastPoll > 5000) {

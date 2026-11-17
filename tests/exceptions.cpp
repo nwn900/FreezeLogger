@@ -218,6 +218,52 @@ int wmain(int argc, wchar_t** argv) {
               "handled access violations remain in the exception ring");
     }
 
+    // Provisional reads are coherent: an odd generation is busy, a stable one
+    // returns the complete payload, and concurrent writes never mix fields.
+    {
+        fs::Shared shared{};
+        shared.provisionalGeneration = 1;
+        shared.provisionalCode = 0xC0000005;
+        shared.provisionalThread = 7;
+        shared.provisionalAddress = 0x1111;
+        shared.provisionalTick = 10;
+        auto busy = fs::snapshotProvisional(shared);
+        check(busy.busy && !busy.valid, "an odd provisional generation is reported busy");
+        shared.provisionalGeneration = 2;
+        auto stable = fs::snapshotProvisional(shared);
+        check(stable.valid && stable.code == 0xC0000005 && stable.thread == 7 &&
+              stable.address == 0x1111 && stable.tick == 10,
+              "a stable provisional generation returns the complete payload");
+    }
+    {
+        fs::Shared shared{};
+        std::atomic<bool> stop{false};
+        std::thread writer([&] {
+            for (DWORD value = 1; value < 20000; ++value) {
+                InterlockedIncrement64(&shared.provisionalGeneration);
+                shared.provisionalCode = value;
+                shared.provisionalThread = value;
+                shared.provisionalAddress = value;
+                shared.provisionalTick = value;
+                MemoryBarrier();
+                InterlockedIncrement64(&shared.provisionalGeneration);
+                InterlockedExchange(&shared.provisionalCount, value);
+            }
+            stop = true;
+        });
+        unsigned valid = 0, mixed = 0;
+        while (!stop) {
+            auto snapshot = fs::snapshotProvisional(shared);
+            if (!snapshot.valid) continue;
+            ++valid;
+            if (snapshot.code != snapshot.thread || snapshot.code != static_cast<DWORD>(snapshot.address) ||
+                snapshot.code != static_cast<DWORD>(snapshot.tick)) ++mixed;
+        }
+        writer.join();
+        check(mixed == 0, "concurrent provisional reads never mix fields");
+        check(valid > 0, "concurrent provisional reads observe stable records");
+    }
+
     // The first-chance journal covers every terminal-classifiable code, not a
     // hand-picked subset, and handled faults never consume the terminal slot.
     {
@@ -232,6 +278,8 @@ int wmain(int argc, wchar_t** argv) {
     // Exit classification must match the evidence, never an optimistic label.
     check(std::string(fs::classifyExit(true, 0xC0000005, 2, 4, false)) == "fatal-exception-captured-with-dump",
           "validated dump is labelled captured-with-dump");
+    check(std::string(fs::classifyExit(true, 0xC0000005, 2, 5, false)) == "fatal-exception-captured-dump-only",
+          "a validated dump with failed text is labelled dump-only");
     check(std::string(fs::classifyExit(true, 0xC0000005, 2, 3, false)) == "fatal-exception-captured-text-only",
           "text-only capture is labelled text-only");
     check(std::string(fs::classifyExit(true, 0xC0000005, 2, 2, false)) == "fatal-exception-capture-incomplete",

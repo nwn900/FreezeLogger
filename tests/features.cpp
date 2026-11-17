@@ -283,6 +283,8 @@ int wmain(int argc, wchar_t** argv) {
         std::cout << "PASS: real DXGI Present ETW, test exclusion, adapter precedence. Evidence: " << folder.string() << '\n';
         return 0;
     }
+    check(fs::sessionId(42, 1000) == L"42-1000" && fs::sessionId(42, 2000) != fs::sessionId(42, 1000),
+          "session identity includes the process creation time");
     fs::History history(10000);
     fs::FrameGate frameGate;
     auto frame = [](LONG source, LONG64 tick, LONG64 count) {

@@ -67,6 +67,7 @@ inline bool isJournalExceptionCode(DWORD code) noexcept {
 inline const char* classifyExit(bool exitCodeKnown, DWORD exitCode, LONG crashSequence,
                                 LONG captureState, bool userClose) noexcept {
     if (!exitCodeKnown) return "unknown_exit_status";
+    if (captureState == 5) return "fatal-exception-captured-dump-only";
     if (captureState == 4) return "fatal-exception-captured-with-dump";
     if (captureState == 3) return "fatal-exception-captured-text-only";
     if (captureState == 2) return "fatal-exception-capture-incomplete";

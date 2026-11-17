@@ -173,7 +173,10 @@ int wmain(int argc, wchar_t** argv) {
     }
     ticks(1800);
     check(reports(output).empty(), "healthy host produces no incident");
-    auto sessionLog = output / ("session-" + std::to_string(GetCurrentProcessId()) + ".log");
+    FILETIME creation{}, exit{}, kernel{}, user{};
+    GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user);
+    const auto session = std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(fs::filetime(creation));
+    auto sessionLog = output / (L"session-" + session + L".log");
     check(contents(sessionLog).find("layout_overrides=1") != std::string::npos,
           "watcher reads the layout override file");
     std::string save = "FixtureSave.fos";

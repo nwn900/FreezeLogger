@@ -523,7 +523,7 @@ std::string profile(HANDLE target, bool stacks, Shared* state, bool reset) {
 bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
              const std::string& reason, Shared* state, bool dump, const std::string& history, bool quick,
              CaptureResult* result) {
-    if (result) *result = {};
+    if (result) { *result = {}; result->dumpRequested = dump; }
     ExceptionJournal exceptionJournal(state);
     const auto gameImage = processImage(target);
     SYSTEMTIME utc{}; GetSystemTime(&utc);
@@ -534,6 +534,9 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     stem << prefix << std::setfill('0') << std::setw(4) << utc.wYear << std::setw(2) << utc.wMonth
          << std::setw(2) << utc.wDay << '-' << std::setw(2) << utc.wHour << std::setw(2) << utc.wMinute
          << std::setw(2) << utc.wSecond << '-' << std::setw(3) << utc.wMilliseconds << '-' << pid;
+    // Correlate the incident with the session, not just the reusable PID.
+    const auto created = state ? static_cast<unsigned long long>(read(state->processCreated)) : 0;
+    if (created) stem << '-' << created;
     auto logPath = folder / (stem.str() + ".log");
     std::ofstream log(logPath, std::ios::out | std::ios::trunc);
     if (!log) return false;
@@ -954,7 +957,6 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     }
     if (result) {
         result->anyThreadEvidence = sampled;
-        result->dumpRequested = dump;
         result->textComplete = sampled && persisted;
     }
     return sampled && persisted;

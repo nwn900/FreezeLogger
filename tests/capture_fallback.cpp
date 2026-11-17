@@ -81,6 +81,8 @@ int wmain() {
     fs::setCaptureLogFailureForTest(nullptr);
     if (creation.complete || creation.result.textComplete) fail("a failed log creation must not claim completion");
     if (!creation.text.empty()) fail("a failed log creation must not leave a report");
+    if (!creation.result.dumpRequested) fail("the dump request must be recorded before an early failure");
+    if (creation.result.dumpValidated) fail("an early failure cannot validate a dump");
 
     fs::setCaptureLogFailureForTest(failAtFinalWrite);
     auto finalWrite = runCapture(root / "log-final", "log-final-test");
@@ -90,6 +92,12 @@ int wmain() {
     if (finalWrite.text.empty()) fail("a failed final write must preserve partial evidence");
     if (finalWrite.text.find("collection complete") != std::string::npos)
         fail("a failed final write must not contain the completion marker");
+    if (!finalWrite.result.dumpValidated)
+        fail("a validated dump must survive a failed text write");
+    bool dumpFound = false;
+    for (const auto& entry : std::filesystem::directory_iterator(root / "log-final"))
+        if (entry.path().extension() == ".dmp") dumpFound = true;
+    if (!dumpFound) fail("the validated dump file is missing");
 
     std::cout << "PASS: capture capabilities and text persistence are reported truthfully\n";
     return 0;

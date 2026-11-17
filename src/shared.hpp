@@ -167,9 +167,45 @@ struct alignas(8) Shared {
     DWORD provisionalCode = 0, provisionalThread = 0;
     DWORD64 provisionalAddress = 0;
 };
+// Coherent read of the provisional first-chance record. The writer toggles the
+// generation odd/even around its fields; a reader accepts only matching even
+// generations and reports busy instead of mixing two observations.
+struct ProvisionalSnapshot {
+    bool valid = false;
+    bool busy = false;
+    LONG count = 0;
+    DWORD code = 0, thread = 0;
+    DWORD64 address = 0;
+    LONG64 tick = 0;
+};
+inline ProvisionalSnapshot snapshotProvisional(const Shared& state) noexcept {
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        LONG64 before = InterlockedCompareExchange64(
+            const_cast<volatile LONG64*>(&state.provisionalGeneration), 0, 0);
+        if (before & 1) continue; // writer active
+        ProvisionalSnapshot result;
+        result.count = InterlockedCompareExchange(const_cast<volatile LONG*>(&state.provisionalCount), 0, 0);
+        result.code = state.provisionalCode;
+        result.thread = state.provisionalThread;
+        result.address = state.provisionalAddress;
+        result.tick = InterlockedCompareExchange64(const_cast<volatile LONG64*>(&state.provisionalTick), 0, 0);
+        MemoryBarrier();
+        LONG64 after = InterlockedCompareExchange64(
+            const_cast<volatile LONG64*>(&state.provisionalGeneration), 0, 0);
+        if (before == after && !(after & 1)) { result.valid = true; return result; }
+    }
+    ProvisionalSnapshot busy; busy.busy = true; return busy;
+}
 inline LONG64 read(volatile LONG64& value) { return InterlockedCompareExchange64(&value, 0, 0); }
 inline LONG read(volatile LONG& value) { return InterlockedCompareExchange(&value, 0, 0); }
 inline LONG64 now() { return static_cast<LONG64>(GetTickCount64()); }
+// Session identity: Windows reuses process IDs, so session-scoped files carry
+// the process creation FILETIME as well. Legacy PID-only names remain readable.
+inline std::wstring sessionId(DWORD pid, LONG64 created) {
+    std::wstring id = std::to_wstring(pid);
+    if (created) { id += L'-'; id += std::to_wstring(created); }
+    return id;
+}
 // ReadProcessMemory accounting for the overhead budget. The context reader and
 // the capture collector are counted separately so a log field cannot be read as
 // "all process reads" when it only covers one instrumented path.
