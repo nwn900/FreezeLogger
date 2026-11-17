@@ -1,6 +1,7 @@
 #include "api.hpp"
 #include "shared.hpp"
 #include "exceptions.hpp"
+#include "defaults.hpp"
 #include <process.h>
 #include <array>
 #include <fstream>
@@ -206,7 +207,15 @@ bool load(const fs::Host* host) {
     auto ini = dllFolder / "FreezeLogger.ini";
     if (!std::filesystem::exists(ini)) {
         auto legacy = dllFolder / "FreezeSentryF4.ini";
-        if (std::filesystem::exists(legacy)) ini = legacy;
+        if (std::filesystem::exists(legacy)) {
+            ini = legacy;
+        } else if (fs::writeDefaultIni(ini)) {
+            // First run: leave the documented defaults on disk so users have a
+            // file to edit instead of only compiled-in values.
+            startupLog("Generated default FreezeLogger.ini");
+        } else {
+            startupLog("Cannot generate FreezeLogger.ini; using built-in defaults");
+        }
     }
     state->timeoutMs = setting(ini, L"TimeoutSeconds", 15, 2, 3600) * 1000;
     state->loadingMs = setting(ini, L"LoadingTimeoutSeconds", 120, 2, 3600) * 1000;

@@ -23,6 +23,14 @@ int wmain(int argc, wchar_t** argv) {
     fs::Host host{0, 0x010A0A30, 0, 0, query, handle};
     DWORD before = 0, after = 0; GetProcessHandleCount(GetCurrentProcess(), &before);
     check(!load(&host), "missing helper fails initialization");
+    check(std::filesystem::exists(directory / "FreezeLogger.ini"), "missing INI is generated on first load");
+    {
+        std::ifstream generated(directory / "FreezeLogger.ini");
+        std::string text{std::istreambuf_iterator<char>(generated), std::istreambuf_iterator<char>()};
+        check(text.find("[FreezeLogger]") != std::string::npos && text.find("TimeoutSeconds=15") != std::string::npos &&
+              text.find("WriteMinidump=0") != std::string::npos,
+              "generated INI carries the documented defaults");
+    }
     // First CreateProcess/profile API calls may initialize persistent OS/CRT handles.
     // Repeated failures after that warm-up must not accumulate mapping/process handles.
     GetProcessHandleCount(GetCurrentProcess(), &before);

@@ -1,0 +1,64 @@
+#pragma once
+#include <filesystem>
+#include <fstream>
+
+namespace fs {
+// Documented defaults, identical to dist/F4SE/Plugins/FreezeLogger.ini. The
+// plugin writes this file on first run when no INI is present so users have a
+// file to edit instead of only compiled-in defaults.
+inline constexpr char defaultIni[] = R"([FreezeLogger]
+; Time without a normal/UI task callback before a suspected stall report.
+TimeoutSeconds=15
+; Loading and saving can legitimately take longer. They still have a deadline.
+LoadingTimeoutSeconds=120
+StartupTimeoutSeconds=180
+ProbeMilliseconds=250
+; Legacy default for MaxFreezeReports and MaxManualReports; category values override it.
+MaxReports=10
+; MaxFreezeReports: how many automatic freeze/hang incident pairs (log plus
+; optional dump) are kept in the report folder. When the cap is exceeded the
+; oldest automatic pair is deleted first; manual captures are counted separately.
+MaxFreezeReports=10
+; MaxManualReports: how many manual (Pause/Break) incident pairs are kept.
+MaxManualReports=10
+; 1 suppresses queue-stall reports while the game is backgrounded but responsive
+; (likely Alt-Tab pause); an unresponsive background window still reports.
+SuppressBackgroundHang=1
+; Seconds after returning to foreground before a continuing stall reports.
+ForegroundGraceSeconds=10
+; MaxStorageMB: soft cap on the total size (MiB) of evidence this tool owns in
+; the report folder. Old dumps are deleted before old text, and active/recent
+; evidence is protected, so the cap can be exceeded briefly. 0 disables the cap.
+MaxStorageMB=1024
+; Ring of thread CPU/RIP samples, with early stacks after this silence. 0 disables early stacks.
+HistorySeconds=60
+ProfileMilliseconds=2000
+EarlyWarningSeconds=3
+; Read DXGI Present ETW if permitted; queue monitoring remains available if ETW is denied.
+FrameMonitoring=1
+; Read-only cell/menu polling for runtimes with a derived engine layout; unknown images are skipped.
+ContextMonitoring=1
+; Maximum collector operation duration, including large full dumps. 15..900 seconds.
+; Expiry stops only the collector, preserves partial evidence and leaves the game running.
+CaptureTimeoutSeconds=120
+; Opt-in: 1 writes a minidump for each incident. 0 (default) keeps text/thread evidence only.
+WriteMinidump=0
+; 1 includes all committed memory for deeper object/heap analysis; can be tens of GB.
+FullMemoryDump=0
+; 1 asks the watcher for one live minidump when a fatal exception is raised.
+; Handled C++ throws stay in the exception journal until they go unhandled.
+CrashCapture=1
+; Pause/Break captures a manual snapshot while the game window has focus. 0 disables.
+ManualKey=19
+; Optional absolute output directory. Empty uses Documents/My Games/Fallout4[/VR]/F4SE/FreezeLogger.
+ReportDirectory=
+)";
+
+inline bool writeDefaultIni(const std::filesystem::path& path) {
+    std::ofstream out(path, std::ios::out | std::ios::trunc);
+    if (!out) return false;
+    out << defaultIni;
+    out.flush();
+    return static_cast<bool>(out);
+}
+} // namespace fs
