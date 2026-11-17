@@ -252,11 +252,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                     auto result = collect("fatal-exception");
                     // Text and dump are independent outcomes: a validated dump
                     // must never be labelled a failed capture because the text
-                    // stream failed.
-                    LONG captureState = -1;
-                    if (result.dumpValidated) captureState = result.textComplete ? 4 : 5; // 5 = dump-only
-                    else if (result.textComplete) captureState = 3;
-                    else if (result.dumpRequested) captureState = 2;
+                    // stream failed, and a requested dump alone is not evidence.
+                    LONG captureState = fs::captureStateFromResult(result.textComplete, result.dumpValidated,
+                                                                   result.anyThreadEvidence);
                     InterlockedExchange(&state->crashCaptureState, captureState);
                     session << "crash_capture_state=" << captureState << " text_complete=" << result.textComplete
                             << " dump_validated=" << result.dumpValidated << '\n';

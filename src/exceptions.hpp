@@ -7,9 +7,10 @@
 #include <vector>
 
 namespace fs {
-// Test-only hook: called between the throw-record field writes so a regression
-// test can widen the publication window. Null in production.
+// Test-only hooks: called inside the publication critical sections so a
+// regression test can widen the window. Null in production.
 inline void (*cppThrowTestHook)() = nullptr;
+inline void (*provisionalTestHook)() = nullptr;
 struct KeptFault {
     bool present = false;
     DWORD code = 0, thread = 0;
@@ -233,10 +234,13 @@ private:
         state_->provisionalThread = GetCurrentThreadId();
         state_->provisionalAddress = reinterpret_cast<DWORD64>(address);
         state_->provisionalTick = now();
+        // The count is part of the versioned record: publishing it after the
+        // even generation would let a reader pair new fields with the old count.
+        InterlockedIncrement(&state_->provisionalCount);
         MemoryBarrier();
         InterlockedIncrement64(&state_->provisionalGeneration);
+        if (provisionalTestHook) provisionalTestHook();
         InterlockedExchange(&state_->provisionalWriting, 0);
-        InterlockedIncrement(&state_->provisionalCount);
     }
 
 public:

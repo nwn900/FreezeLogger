@@ -127,6 +127,12 @@ bool runAbortChild(const wchar_t* mode, DWORD expectedExit, bool expectCrash) {
     return true;
 }
 
+std::atomic<bool> provisionalHookEntered{false}, provisionalHookRelease{false};
+void provisionalHook() {
+    provisionalHookEntered = true;
+    while (!provisionalHookRelease) Sleep(1);
+}
+
 std::atomic<int> hookInside{0}, hookMax{0};
 void throwHook() {
     int now = hookInside.fetch_add(1) + 1;
@@ -237,31 +243,65 @@ int wmain(int argc, wchar_t** argv) {
     }
     {
         fs::Shared shared{};
-        std::atomic<bool> stop{false};
+        std::atomic<int> barrier{0};
+        std::atomic<bool> readerStarted{false};
+        std::atomic<unsigned> writerIterations{0};
+        auto arrive = [&] {
+            barrier.fetch_add(1);
+            while (barrier.load() < 2) Sleep(0);
+        };
         std::thread writer([&] {
+            arrive();
+            while (!readerStarted) Sleep(0);
             for (DWORD value = 1; value < 20000; ++value) {
                 InterlockedIncrement64(&shared.provisionalGeneration);
                 shared.provisionalCode = value;
                 shared.provisionalThread = value;
                 shared.provisionalAddress = value;
                 shared.provisionalTick = value;
+                InterlockedExchange(&shared.provisionalCount, value);
                 MemoryBarrier();
                 InterlockedIncrement64(&shared.provisionalGeneration);
-                InterlockedExchange(&shared.provisionalCount, value);
+                writerIterations.store(value);
             }
-            stop = true;
+            writerIterations.store(20000);
         });
+        arrive();
         unsigned valid = 0, mixed = 0;
-        while (!stop) {
+        do {
             auto snapshot = fs::snapshotProvisional(shared);
-            if (!snapshot.valid) continue;
-            ++valid;
-            if (snapshot.code != snapshot.thread || snapshot.code != static_cast<DWORD>(snapshot.address) ||
-                snapshot.code != static_cast<DWORD>(snapshot.tick)) ++mixed;
-        }
+            if (snapshot.valid) {
+                ++valid;
+                if (snapshot.code != snapshot.thread || snapshot.code != static_cast<DWORD>(snapshot.address) ||
+                    snapshot.code != static_cast<DWORD>(snapshot.tick) ||
+                    snapshot.code != static_cast<DWORD>(snapshot.count)) ++mixed;
+            }
+            readerStarted = true;
+        } while (writerIterations.load() < 20000 || valid < 100);
         writer.join();
-        check(mixed == 0, "concurrent provisional reads never mix fields");
-        check(valid > 0, "concurrent provisional reads observe stable records");
+        check(mixed == 0, "concurrent provisional reads never mix fields or counts");
+        check(valid >= 100, "concurrent provisional reads observe stable records");
+    }
+    // The publication count is part of the versioned record: a reader that sees
+    // the new fields must also see the new count.
+    {
+        fs::Shared shared{};
+        fs::ExceptionJournal journal(&shared);
+        check(journal.install(&shared), "journal installs for provisional count test");
+        handledAccessViolations(1);
+        check(fs::read(shared.provisionalCount) == 1, "first provisional event counted");
+        provisionalHookEntered = false; provisionalHookRelease = false;
+        fs::provisionalTestHook = provisionalHook;
+        std::thread writer([] { handledAccessViolations(1); });
+        auto deadline = GetTickCount64() + 5000;
+        while (!provisionalHookEntered && GetTickCount64() < deadline) Sleep(1);
+        check(provisionalHookEntered.load(), "writer paused inside the publication");
+        auto snapshot = fs::snapshotProvisional(shared);
+        check(snapshot.valid && snapshot.count == 2 && snapshot.code == EXCEPTION_ACCESS_VIOLATION,
+              "a stable generation publishes its own count, not the previous one");
+        provisionalHookRelease = true;
+        writer.join();
+        fs::provisionalTestHook = nullptr;
     }
 
     // The first-chance journal covers every terminal-classifiable code, not a
@@ -293,6 +333,15 @@ int wmain(int argc, wchar_t** argv) {
           "nonzero exit without evidence is unclassified");
     check(std::string(fs::classifyExit(false, 0, 0, 0, false)) == "unknown_exit_status",
           "unknown exit status is explicit");
+    check(fs::captureStateFromResult(false, false, false) == -1, "no evidence maps to capture-failed");
+    check(fs::captureStateFromResult(false, false, true) == 2, "partial thread evidence maps to incomplete");
+    check(fs::captureStateFromResult(true, false, true) == 3, "complete text maps to text-only");
+    check(fs::captureStateFromResult(true, true, true) == 4, "text plus validated dump maps to with-dump");
+    check(fs::captureStateFromResult(false, true, true) == 5, "validated dump without text maps to dump-only");
+    check(std::string(fs::classifyExit(false, 0, 2, 4, false)) == "fatal-exception-captured-with-dump",
+          "existing evidence is described even when the exit code is unavailable");
+    check(std::string(fs::classifyExit(false, 0, 2, -1, false)) == "fatal-exception-capture-failed",
+          "a failed capture is described even when the exit code is unavailable");
 
     // Reinstallation must not chain the unhandled filter to itself.
     {

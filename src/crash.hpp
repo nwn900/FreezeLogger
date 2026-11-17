@@ -61,17 +61,26 @@ inline bool isJournalExceptionCode(DWORD code) noexcept {
         return false;
     }
 }
+// Map a capture result to the terminal capture state. "Incomplete" requires
+// actual durable evidence; a requested dump alone is not evidence.
+inline LONG captureStateFromResult(bool textComplete, bool dumpValidated, bool anyThreadEvidence) noexcept {
+    if (dumpValidated) return textComplete ? 4 : 5; // 5 = dump-only
+    if (textComplete) return 3;
+    if (anyThreadEvidence) return 2;
+    return -1;
+}
 // Exit classification from observed evidence. "Captured" is reserved for a
 // completed text report or a validated dump; an observed-but-unfinished capture
-// is never labelled captured.
+// is never labelled captured. Existing evidence is described even when the exit
+// code could not be queried.
 inline const char* classifyExit(bool exitCodeKnown, DWORD exitCode, LONG crashSequence,
                                 LONG captureState, bool userClose) noexcept {
-    if (!exitCodeKnown) return "unknown_exit_status";
     if (captureState == 5) return "fatal-exception-captured-dump-only";
     if (captureState == 4) return "fatal-exception-captured-with-dump";
     if (captureState == 3) return "fatal-exception-captured-text-only";
     if (captureState == 2) return "fatal-exception-capture-incomplete";
     if (captureState == -1) return "fatal-exception-capture-failed";
+    if (!exitCodeKnown) return "unknown_exit_status";
     if ((crashSequence & ~1L) && !(crashSequence & 1L)) return "fatal-exception-observed-not-captured";
     if (userClose && exitCode == 0) return "user-close";
     if (exitCode) return "nonzero_exit_unclassified";
