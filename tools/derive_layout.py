@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Derive a FreezeSentryF4 engine-layout row from a Fallout 4 executable.
+"""Derive a FreezeLogger engine-layout row from a Fallout 4 executable.
 
 The context adapter is the only part of the plugin that needs per-version
 knowledge. This tool produces that knowledge from a plaintext executable so a

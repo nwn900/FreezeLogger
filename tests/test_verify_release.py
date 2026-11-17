@@ -62,20 +62,20 @@ class ReleaseVerifierTests(unittest.TestCase):
         self.watch_guid = bytes.fromhex("ffeeddccbbaa99887766554433221100")
         self.plugin_age = 3
         self.watch_age = 4
-        self.plugin_binary = make_pe(self.plugin_guid, self.plugin_age, "FreezeSentryF4.pdb")
-        self.watch_binary = make_pe(self.watch_guid, self.watch_age, "FreezeSentryF4Watch.pdb")
+        self.plugin_binary = make_pe(self.plugin_guid, self.plugin_age, "FreezeLogger.pdb")
+        self.watch_binary = make_pe(self.watch_guid, self.watch_age, "FreezeLoggerWatch.pdb")
         self.plugin_pdb = make_pdb(self.plugin_guid, self.plugin_age)
         self.watch_pdb = make_pdb(self.watch_guid, self.watch_age)
-        (output / "FreezeSentryF4.dll").write_bytes(self.plugin_binary)
-        (output / "FreezeSentryF4Watch.exe").write_bytes(self.watch_binary)
-        (output / "FreezeSentryF4.pdb").write_bytes(self.plugin_pdb)
-        (output / "FreezeSentryF4Watch.pdb").write_bytes(self.watch_pdb)
+        (output / "FreezeLogger.dll").write_bytes(self.plugin_binary)
+        (output / "FreezeLoggerWatch.exe").write_bytes(self.watch_binary)
+        (output / "FreezeLogger.pdb").write_bytes(self.plugin_pdb)
+        (output / "FreezeLoggerWatch.pdb").write_bytes(self.watch_pdb)
         self.source = self.root / "source"
         (self.source / "src").mkdir(parents=True)
         (self.source / "dist/F4SE/Plugins").mkdir(parents=True)
         (self.source / "src/plugin.cpp").write_text('setting(ini, L"TimeoutSeconds")', encoding="utf-8")
-        self.ini = b"[FreezeSentryF4]\nTimeoutSeconds=15\n"
-        (self.source / "dist/F4SE/Plugins/FreezeSentryF4.ini").write_bytes(self.ini)
+        self.ini = b"[FreezeLogger]\nTimeoutSeconds=15\n"
+        (self.source / "dist/F4SE/Plugins/FreezeLogger.ini").write_bytes(self.ini)
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -94,13 +94,13 @@ class ReleaseVerifierTests(unittest.TestCase):
 
     def release_entries(self, include_symbols=True):
         entries = {
-            "F4SE/Plugins/FreezeSentryF4.dll": self.plugin_binary,
-            "F4SE/Plugins/FreezeSentryF4Watch.exe": self.watch_binary,
-            "F4SE/Plugins/FreezeSentryF4.ini": self.ini,
+            "F4SE/Plugins/FreezeLogger.dll": self.plugin_binary,
+            "F4SE/Plugins/FreezeLoggerWatch.exe": self.watch_binary,
+            "F4SE/Plugins/FreezeLogger.ini": self.ini,
         }
         if include_symbols:
-            entries["F4SE/Plugins/FreezeSentryF4.pdb"] = self.plugin_pdb
-            entries["F4SE/Plugins/FreezeSentryF4Watch.pdb"] = self.watch_pdb
+            entries["F4SE/Plugins/FreezeLogger.pdb"] = self.plugin_pdb
+            entries["F4SE/Plugins/FreezeLoggerWatch.pdb"] = self.watch_pdb
         return entries
 
     def test_accepts_canonical_root_with_matching_pdbs(self):
@@ -133,16 +133,16 @@ class ReleaseVerifierTests(unittest.TestCase):
 
     def test_rejects_pdb_identity_that_does_not_match_built_binary(self):
         wrong_pdb = make_pdb(b"X" * 16, self.plugin_age)
-        (self.build / "RelWithDebInfo/FreezeSentryF4.pdb").write_bytes(wrong_pdb)
+        (self.build / "RelWithDebInfo/FreezeLogger.pdb").write_bytes(wrong_pdb)
         entries = self.release_entries()
-        entries["F4SE/Plugins/FreezeSentryF4.pdb"] = wrong_pdb
+        entries["F4SE/Plugins/FreezeLogger.pdb"] = wrong_pdb
         package = self.root / "wrong-identity.zip"
         self.write_zip(package, entries)
         self.assertEqual(self.verify(package), 1)
 
     def test_rejects_packaged_pdb_different_from_build_output(self):
         entries = self.release_entries()
-        entries["F4SE/Plugins/FreezeSentryF4.pdb"] = make_pdb(b"X" * 16, self.plugin_age)
+        entries["F4SE/Plugins/FreezeLogger.pdb"] = make_pdb(b"X" * 16, self.plugin_age)
         package = self.root / "stale-symbols.zip"
         self.write_zip(package, entries)
         self.assertEqual(self.verify(package), 1)
@@ -150,11 +150,11 @@ class ReleaseVerifierTests(unittest.TestCase):
     def test_rejects_required_files_split_across_zip_roots(self):
         package = self.root / "split.zip"
         self.write_zip(package, {
-            "piece0/F4SE/Plugins/FreezeSentryF4.dll": self.plugin_binary,
-            "piece1/F4SE/Plugins/FreezeSentryF4Watch.exe": self.watch_binary,
-            "piece2/F4SE/Plugins/FreezeSentryF4.ini": self.ini,
-            "piece3/F4SE/Plugins/FreezeSentryF4.pdb": self.plugin_pdb,
-            "piece4/F4SE/Plugins/FreezeSentryF4Watch.pdb": self.watch_pdb,
+            "piece0/F4SE/Plugins/FreezeLogger.dll": self.plugin_binary,
+            "piece1/F4SE/Plugins/FreezeLoggerWatch.exe": self.watch_binary,
+            "piece2/F4SE/Plugins/FreezeLogger.ini": self.ini,
+            "piece3/F4SE/Plugins/FreezeLogger.pdb": self.plugin_pdb,
+            "piece4/F4SE/Plugins/FreezeLoggerWatch.pdb": self.watch_pdb,
         })
         self.assertEqual(self.verify(package), 1)
 
@@ -223,7 +223,7 @@ class PackageReceiptFreshnessTests(unittest.TestCase):
             report.write_text("<testsuite/>", encoding="utf-8")
             old = time.time() - 100
             os.utime(report, (old, old))
-            exe = root / "FreezeSentryF4ExceptionTests.exe"
+            exe = root / "FreezeLoggerExceptionTests.exe"
             exe.write_bytes(b"MZ")
             os.utime(exe, (old, old))
             self.assertIsNone(package.stale_receipt(report, [exe]))
@@ -236,12 +236,12 @@ class PackageReceiptFreshnessTests(unittest.TestCase):
             build = Path(temporary)
             output = build / "RelWithDebInfo"
             output.mkdir()
-            (output / "FreezeSentryF4ExceptionTests.exe").write_bytes(b"MZ")
-            (output / "FreezeSentryF4.dll").write_bytes(b"MZ")
+            (output / "FreezeLoggerExceptionTests.exe").write_bytes(b"MZ")
+            (output / "FreezeLogger.dll").write_bytes(b"MZ")
             inputs = package.test_inputs(build, "RelWithDebInfo")
             names = {path.name for path in inputs}
-            self.assertIn("FreezeSentryF4ExceptionTests.exe", names)
-            self.assertIn("FreezeSentryF4.dll", names)
+            self.assertIn("FreezeLoggerExceptionTests.exe", names)
+            self.assertIn("FreezeLogger.dll", names)
             self.assertIn("CMakeLists.txt", names)
             self.assertTrue(any(path.suffix == ".py" for path in inputs))
 

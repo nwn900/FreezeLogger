@@ -1,6 +1,6 @@
 // Per-runtime engine layout for the read-only context adapter.
 //
-// The adapter is the only part of FreezeSentryF4 that touches engine memory, so
+// The adapter is the only part of FreezeLogger that touches engine memory, so
 // it is the only part that needs per-version knowledge. That knowledge lives
 // here as data rather than being compiled into the decoder: adding a runtime is
 // a table row, not a code change.
@@ -173,7 +173,7 @@ inline std::size_t parseLayoutOverrides(std::string_view text, LayoutOverrides& 
             current = &out.rows[out.count];
             *current = EngineLayout{};
             current->runtime = static_cast<std::uint32_t>(runtime);
-            current->evidence = "runtime override from FreezeSentryF4.layout.ini";
+            current->evidence = "runtime override from FreezeLogger.layout.ini";
             invalid[out.count] = false;
             ++out.count;
             continue;

@@ -54,13 +54,17 @@ template<size_t N> void clean(char (&text)[N]) {
 }
 void startupLog(const std::string& text) {
     // One startup/error write only; task callbacks never perform file I/O.
-    std::ofstream out(dllFolder / "FreezeSentryF4-startup.log", std::ios::app);
+    std::ofstream out(dllFolder / "FreezeLogger-startup.log", std::ios::app);
     out << text << '\n';
 }
 DWORD setting(const std::filesystem::path& ini, const wchar_t* key, DWORD fallback, DWORD low, DWORD high) {
     wchar_t buffer[64]{};
     auto defaultValue = std::to_wstring(fallback);
-    GetPrivateProfileStringW(L"FreezeSentryF4", key, defaultValue.c_str(), buffer, 64, ini.c_str());
+    // The mod was renamed; keep reading a legacy section so existing INIs work.
+    const wchar_t* sentinel = L"\x01";
+    GetPrivateProfileStringW(L"FreezeLogger", key, sentinel, buffer, 64, ini.c_str());
+    if (wcscmp(buffer, sentinel) == 0)
+        GetPrivateProfileStringW(L"FreezeSentryF4", key, defaultValue.c_str(), buffer, 64, ini.c_str());
     wchar_t* end = nullptr;
     auto n = wcstoull(buffer, &end, 10);
     return end == buffer || *end || n < low || n > high ? fallback : static_cast<DWORD>(n);
@@ -128,7 +132,7 @@ bool launchWatch() {
     return true;
 }
 bool startHelper() {
-    auto exe = dllFolder / "FreezeSentryF4Watch.exe";
+    auto exe = dllFolder / "FreezeLoggerWatch.exe";
     auto command = L"\"" + exe.wstring() + L"\" --watch " + std::to_wstring(reinterpret_cast<ULONG_PTR>(mapping));
     SIZE_T bytes = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &bytes);
@@ -199,7 +203,11 @@ bool load(const fs::Host* host) {
     FILETIME creation{}, exit{}, kernel{}, user{};
     if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) return false;
     state->processCreated = fs::filetime(creation);
-    auto ini = dllFolder / "FreezeSentryF4.ini";
+    auto ini = dllFolder / "FreezeLogger.ini";
+    if (!std::filesystem::exists(ini)) {
+        auto legacy = dllFolder / "FreezeSentryF4.ini";
+        if (std::filesystem::exists(legacy)) ini = legacy;
+    }
     state->timeoutMs = setting(ini, L"TimeoutSeconds", 15, 2, 3600) * 1000;
     state->loadingMs = setting(ini, L"LoadingTimeoutSeconds", 120, 2, 3600) * 1000;
     state->startupMs = setting(ini, L"StartupTimeoutSeconds", 180, 2, 3600) * 1000;
@@ -225,7 +233,9 @@ bool load(const fs::Host* host) {
     if (HANDLE crashEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr))
         state->crashEvent = reinterpret_cast<ULONG_PTR>(crashEvent);
     state->manualKey = setting(ini, L"ManualKey", VK_PAUSE, 0, 255);
-    GetPrivateProfileStringW(L"FreezeSentryF4", L"ReportDirectory", L"", state->outputDirectory, 1024, ini.c_str());
+    GetPrivateProfileStringW(L"FreezeLogger", L"ReportDirectory", L"\x01", state->outputDirectory, 1024, ini.c_str());
+    if (wcscmp(state->outputDirectory, L"\x01") == 0)
+        GetPrivateProfileStringW(L"FreezeSentryF4", L"ReportDirectory", L"", state->outputDirectory, 1024, ini.c_str());
     if (!startHelper()) return false;
     // Keep callback code alive for process lifetime, including initialization failures.
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
@@ -240,7 +250,7 @@ bool load(const fs::Host* host) {
     }
     auto* scaleform = static_cast<fs::Scaleform*>(host->query(fs::scaleformID));
     if (scaleform && scaleform->version >= 1 && scaleform->registerCallback) {
-        if (!scaleform->registerCallback("FreezeSentryF4", movieCreated)) startupLog("Scaleform creation events unavailable");
+        if (!scaleform->registerCallback("FreezeLogger", movieCreated)) startupLog("Scaleform creation events unavailable");
     }
     if (tasks) {
         HANDLE worker = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, pump, nullptr, 0, nullptr));
@@ -273,8 +283,8 @@ bool load(const fs::Host* host) {
 }
 extern "C" {
 // F4SE's address-independent bit also covers having no addresses at all.
-__declspec(dllexport) fs::Version F4SEPlugin_Version{1, 3, "FreezeSentryF4", "", 1, 1, {}, 0, 0, 0, {}};
-__declspec(dllexport) bool FreezeSentryF4_RecordEvent(const fs::EventData* input) {
+__declspec(dllexport) fs::Version F4SEPlugin_Version{1, 3, "Freeze Logger", "", 1, 1, {}, 0, 0, 0, {}};
+__declspec(dllexport) bool FreezeLogger_RecordEvent(const fs::EventData* input) {
     PreserveError preserve;
     fs::EventData value; SIZE_T bytes = 0;
     if (!input || !ReadProcessMemory(GetCurrentProcess(), input, &value, sizeof(value), &bytes) || bytes != sizeof(value) ||
@@ -283,15 +293,22 @@ __declspec(dllexport) bool FreezeSentryF4_RecordEvent(const fs::EventData* input
     clean(value.source); clean(value.name); clean(value.plugin);
     return record(value);
 }
-__declspec(dllexport) bool FreezeSentryF4_FramePulse() {
+__declspec(dllexport) bool FreezeLogger_FramePulse() {
     PreserveError preserve;
     if (!state || fs::read(state->ready) != 1) return false;
     auto tick = fs::now();
     return state->nativeFrames.publish(tick, tick, GetCurrentThreadId());
 }
+// Legacy export names from before the rename; adapters keep working.
+__declspec(dllexport) bool FreezeSentryF4_RecordEvent(const fs::EventData* input) {
+    return FreezeLogger_RecordEvent(input);
+}
+__declspec(dllexport) bool FreezeSentryF4_FramePulse() {
+    return FreezeLogger_FramePulse();
+}
 __declspec(dllexport) bool F4SEPlugin_Query(const fs::Host* host, fs::Info* info) {
     if (!info) return false;
-    *info = {1, "FreezeSentryF4", 3};
+    *info = {1, "Freeze Logger", 3};
     return host && !host->isEditor && host->query && host->handle;
 }
 __declspec(dllexport) bool F4SEPlugin_Load(const fs::Host* host) {

@@ -54,7 +54,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (!target.value || !GetProcessTimes(target, &creation, &exit, &kernel, &user) ||
         fs::filetime(creation) != fs::read(state->processCreated)) return 5;
     try {
-        fs::Lifetime lifetime(target, 30000, L"FreezeSentryF4-" + std::to_wstring(state->pid) + L"-" + std::to_wstring(fs::read(state->processCreated)));
+        fs::Lifetime lifetime(target, 30000, L"FreezeLogger-" + std::to_wstring(state->pid) + L"-" + std::to_wstring(fs::read(state->processCreated)));
         std::array<wchar_t, 32768> exe{};
         DWORD length = static_cast<DWORD>(exe.size());
         std::filesystem::path gameImage;
@@ -72,7 +72,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         std::ofstream session(sessionPath, std::ios::trunc);
         if (gameImageQueryError)
             session << "game_image_query_error=" << gameImageQueryError << "; external crash logs will not be attributed\n";
-        session << "FreezeSentryF4 monitor started. PID=" << state->pid << " runtime=" << state->runtime
+        session << "FreezeLogger monitor started. PID=" << state->pid << " runtime=" << state->runtime
                 << " task_monitoring=" << state->taskMonitoring << '\n';
         session.flush();
         if (!session) return 6;
@@ -90,8 +90,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             std::array<wchar_t, 32768> self{};
             DWORD selfLength = GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size()));
             if (selfLength && selfLength < self.size()) {
-                std::ifstream layoutIni(std::filesystem::path(self.data()).parent_path() / "FreezeSentryF4.layout.ini",
-                                        std::ios::binary);
+                auto layoutPath = std::filesystem::path(self.data()).parent_path() / "FreezeLogger.layout.ini";
+                if (!std::filesystem::exists(layoutPath)) {
+                    auto legacy = std::filesystem::path(self.data()).parent_path() / "FreezeSentryF4.layout.ini";
+                    if (std::filesystem::exists(legacy)) layoutPath = legacy;
+                }
+                std::ifstream layoutIni(layoutPath, std::ios::binary);
                 if (layoutIni) {
                     // Bounded read: the file is user-supplied and only ever
                     // needs a handful of short sections.
@@ -121,7 +125,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
             GlobalMemoryStatusEx(&memory);
             std::ofstream preflight(folder / (L"preflight-" + sessionKey + L".json"), std::ios::trunc);
             preflight << "{\n"
-                      << "  \"tool\": \"FreezeSentryF4 " << fs::toolVersion << "\",\n"
+                      << "  \"tool\": \"FreezeLogger " << fs::toolVersion << "\",\n"
                       << "  \"shared_version\": 10,\n"
                       << "  \"game_image\": \"" << fs::jsonEscape(fs::diagnosticPath(gameImage)) << "\",\n"
                       << "  \"pid\": " << state->pid << ",\n"

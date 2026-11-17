@@ -1,6 +1,6 @@
 # Origin and dependencies
 
-FreezeSentryF4 was written independently for Fallout 4. The user supplied the
+Freeze Logger was written independently for Fallout 4. The user supplied the
 Skyrim FreezeLogger repository as product inspiration. Only its public README
 was read. No source, binaries, assets, hook offsets, diagnostic algorithms or
 report formatting from that project are incorporated here.

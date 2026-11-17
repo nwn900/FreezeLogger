@@ -12,17 +12,17 @@ from pathlib import PurePosixPath
 
 
 REQUIRED = (
-    "F4SE/Plugins/FreezeSentryF4.dll",
-    "F4SE/Plugins/FreezeSentryF4Watch.exe",
-    "F4SE/Plugins/FreezeSentryF4.ini",
+    "F4SE/Plugins/FreezeLogger.dll",
+    "F4SE/Plugins/FreezeLoggerWatch.exe",
+    "F4SE/Plugins/FreezeLogger.ini",
 )
 PDB_TO_BINARY = {
-    "F4SE/Plugins/FreezeSentryF4.pdb": "F4SE/Plugins/FreezeSentryF4.dll",
-    "F4SE/Plugins/FreezeSentryF4Watch.pdb": "F4SE/Plugins/FreezeSentryF4Watch.exe",
+    "F4SE/Plugins/FreezeLogger.pdb": "F4SE/Plugins/FreezeLogger.dll",
+    "F4SE/Plugins/FreezeLoggerWatch.pdb": "F4SE/Plugins/FreezeLoggerWatch.exe",
 }
 BUILD_BINARIES = {
-    "F4SE/Plugins/FreezeSentryF4.dll": "FreezeSentryF4.dll",
-    "F4SE/Plugins/FreezeSentryF4Watch.exe": "FreezeSentryF4Watch.exe",
+    "F4SE/Plugins/FreezeLogger.dll": "FreezeLogger.dll",
+    "F4SE/Plugins/FreezeLoggerWatch.exe": "FreezeLoggerWatch.exe",
 }
 MSF7_MAGIC = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0"
 
@@ -243,8 +243,8 @@ def main() -> int:
     build = args.build.resolve()
     source = args.src.resolve()
     plugin = source / "src/plugin.cpp"
-    dist_ini = source / "dist/F4SE/Plugins/FreezeSentryF4.ini"
-    packaged_ini_name = "F4SE/Plugins/FreezeSentryF4.ini"
+    dist_ini = source / "dist/F4SE/Plugins/FreezeLogger.ini"
+    packaged_ini_name = "F4SE/Plugins/FreezeLogger.ini"
     with PackageReader(package) as reader:
         for name in REQUIRED:
             if not reader.exists(name):

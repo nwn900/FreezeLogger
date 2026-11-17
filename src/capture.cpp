@@ -33,7 +33,13 @@ std::filesystem::path reportRoot(bool vr) {
     if (FAILED(result)) throw std::runtime_error("Documents folder unavailable");
     std::filesystem::path root(documents);
     CoTaskMemFree(documents);
-    return root / "My Games" / (vr ? "Fallout4VR" : "Fallout4") / "F4SE" / "FreezeSentryF4";
+    auto base = root / "My Games" / (vr ? "Fallout4VR" : "Fallout4") / "F4SE";
+    auto current = base / "FreezeLogger";
+    auto legacy = base / "FreezeSentryF4";
+    std::error_code error;
+    // Keep using an existing pre-rename report folder so old evidence stays visible.
+    if (!std::filesystem::exists(current, error) && std::filesystem::exists(legacy, error)) return legacy;
+    return current;
 }
 namespace {
 constexpr DWORD64 MIN_COMMIT_BYTES_FOR_VA_CLONE = 2ULL * 1024 * 1024 * 1024; // 2 GiB
@@ -270,7 +276,7 @@ bool writeWerFallbackHint(const std::filesystem::path& folder, const std::filesy
     if (executable.empty()) executable = L"Fallout4.exe";
     const std::string executableUtf8 = diagnosticUtf8(executable);
     const std::string registrySubkey = "HKLM\\SOFTWARE\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\" + executableUtf8;
-    out << "FreezeSentryF4 could not write a minidump for an incident (see snapshot_error= or minidump=FAILED\n"
+    out << "FreezeLogger could not write a minidump for an incident (see snapshot_error= or minidump=FAILED\n"
            "in the incident log). These are separate recovery options:\n\n"
            "For a process that is still frozen, open Task Manager > Details, right-click " << executableUtf8
         << ", then choose Create dump file. This captures the live hang state.\n\n"
@@ -541,7 +547,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     std::ofstream log(logPath, std::ios::out | std::ios::trunc);
     if (!log) return false;
     if (logFailureProbe && logFailureProbe() == 1) return false;
-    log << "FreezeSentryF4 " << toolVersion << "\nUTC=" << utc.wYear << '-' << utc.wMonth << '-' << utc.wDay << ' '
+    log << "FreezeLogger " << toolVersion << "\nUTC=" << utc.wYear << '-' << utc.wMonth << '-' << utc.wDay << ' '
         << utc.wHour << ':' << utc.wMinute << ':' << utc.wSecond << "\nPID=" << pid
         << " reason=" << reason << " tick=" << now() << '\n';
     log << "Observed task silence is a suspected stall. Long work can produce the same signal.\n"

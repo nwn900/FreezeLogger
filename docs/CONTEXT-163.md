@@ -43,7 +43,7 @@ layout row is wrong fails closed instead of reading a guessed address.
 
 ## Adding a runtime without a rebuild
 
-FreezeSentryF4.layout.ini next to the plugin can carry extra rows. Each section
+FreezeLogger.layout.ini next to the plugin can carry extra rows. Each section
 is [Layout.<runtime-hex>] with the same field names as the struct:
 
     [Layout.010C0000]
@@ -73,7 +73,7 @@ cannot shadow a built-in row for the same runtime. The file read is bounded to
 64 KiB.
 
 The read path is covered end to end: the diagnostics fixture drops a
-FreezeSentryF4.layout.ini next to the plugin and asserts the watcher logs
+FreezeLogger.layout.ini next to the plugin and asserts the watcher logs
 layout_overrides=1, so the wiring between the file and the parser is tested and
 not just the parser itself.
 

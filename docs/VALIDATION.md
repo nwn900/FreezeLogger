@@ -1,13 +1,13 @@
 # Validation history
 
-## FreezeSentryF4 0.3.6 Tullius capture paths, 2026-11-07
+## Freeze Logger 0.3.6 Tullius capture paths, 2026-11-07
 
 Live fatal-exception dumps and an adaptive
 loading threshold follow the capture behavior of Tullius CTD Logger. The WinUI
 viewer, dump analyzer, resource hooks, and Address Library game hooks are not
 part of this port. Shared memory is version 8.
 
-## FreezeSentryF4 0.3.5 audit follow-up, 2026-11-07
+## Freeze Logger 0.3.5 audit follow-up, 2026-11-07
 
 [GitHub issue #1](https://github.com/nwn900/FreezeSentryF4/issues/1) third-audit
 follow-up: incident corroboration now rejects a log written a full minute
@@ -17,7 +17,7 @@ the latest frame snapshot immediately before the frame-stall decision so the
 gate's decision clock cannot lag an interleaved fresh Present. Release packaging
 still requires both matching PDBs by default; symbols-free mode remains explicit.
 
-## FreezeSentryF4 0.3.4 audit follow-up, 2026-11-06
+## Freeze Logger 0.3.4 audit follow-up, 2026-11-06
 
 The third audit found three gaps. Crash-log corroboration now requires the
 matching current-process exception to precede the log's last-write timestamp,
@@ -34,13 +34,13 @@ against their binaries. A symbols-free package must explicitly select
 The MSVC `RelWithDebInfo` build succeeded (`Visual Studio 18 2026`, `-A x64`,
 `build-vs/`). All 14 registered CTest cases are accounted for: 13 passed and
 `real-dxgi-etw` skipped because ETW startup returned status 5. This is not ETW
-qualification. Fresh-built `FreezeSentryF4.dll`, `FreezeSentryF4Watch.exe`, and
+qualification. Fresh-built `FreezeLogger.dll`, `FreezeLoggerWatch.exe`, and
 matching PDBs are copied to `deployments/2026-11-07-pre-0.3.5-local/` (ignored
 by git) for handoff into a mod or `Data\F4SE\Plugins` tree. Packaging was not
 run in this session; run `scripts/package.py` after a full JUnit receipt when you
 need a release ZIP.
 
-## FreezeSentryF4 0.3.3 review follow-up, 2026-11-06
+## Freeze Logger 0.3.3 review follow-up, 2026-11-06
 
 The original November 5 crash report is in the Fallout 4 `F4SE` folder. Its
 header reports an access violation at `Fallout4.exe+1C152D6`. The 0.3.1
@@ -79,7 +79,7 @@ save could be selected. No save was loaded or written, and no gameplay or live
 crash-capture claim is made. Keep the GitHub issue open for the copied-save
 gameplay check and native ETW qualification.
 
-## FreezeSentryF4 0.3.2 crash correlation and audit, 2026-11-06
+## Freeze Logger 0.3.2 crash correlation and audit, 2026-11-06
 
 The November 5 Buffout log records an access violation at `Fallout4.exe+1C152D6`
 and repeated stack frames at `Fallout4.exe+1B99DCC`. FreezeSentry's prior
@@ -117,7 +117,7 @@ mod folder match the installed `Data/F4SE/Plugins` hardlinks by SHA-256. The
 predeployment files are backed up at
 `deployments/2026-11-06-pre-0.3.2-vortex`.
 
-## FreezeSentryF4 0.3.1 crash-capture update, 2026-11-05
+## Freeze Logger 0.3.1 crash-capture update, 2026-11-05
 
 The plugin and collector configured and built in `RelWithDebInfo` with Visual
 Studio 2022 Build Tools, MSVC 19.44.35229.0 and Windows SDK 10.0.26100. The
@@ -145,7 +145,7 @@ The previous `build` directory has a stale CMake compiler path from an older
 Visual Studio 18 installation. The 0.3.1 build used a separate directory at
 `build/audit-0.3.1-vs2022`; it did not overwrite the older binaries or receipts.
 
-## FreezeSentryF4 0.3.0 candidate, 2026-10-08
+## Freeze Logger 0.3.0 candidate, 2026-10-08
 
 Built locally with MSVC x64/C++20. No commit, push or public release. The
 0.1.0/0.2.0 packages are preserved. Tests run only in isolated host processes;

@@ -14,7 +14,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = re.search(
-    r"project\(FreezeSentryF4 VERSION ([0-9.]+)",
+    r"project\(FreezeLogger VERSION ([0-9.]+)",
     (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"),
 ).group(1)
 
@@ -206,7 +206,7 @@ def build_source_archive(archive_path: Path, build: Path, config: str, symbols_m
             command = ["cmake", "-S", str(source_root), "-B", str(source_build), "-G", generator.group(1)]
             if platform and platform.group(1):
                 command += ["-A", platform.group(1)]
-            command += [f"-DFSF4_SYMBOLS_MODE:STRING={symbols_mode}"]
+            command += [f"-DFREELOGGER_SYMBOLS_MODE:STRING={symbols_mode}"]
             subprocess.run(command, check=True)
             subprocess.run(["cmake", "--build", str(source_build), "--config", config, "--parallel"], check=True)
 
@@ -229,8 +229,8 @@ def main() -> int:
     artifacts = args.artifacts.resolve()
     report = args.test_report.resolve()
     cache = (build / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
-    configured_symbols = re.search(r"^FSF4_SYMBOLS_MODE:STRING=(required|none)$", cache, re.M)
-    required(configured_symbols is not None, f"CMake cache has no valid FSF4_SYMBOLS_MODE: {build / 'CMakeCache.txt'}")
+    configured_symbols = re.search(r"^FREELOGGER_SYMBOLS_MODE:STRING=(required|none)$", cache, re.M)
+    required(configured_symbols is not None, f"CMake cache has no valid FREELOGGER_SYMBOLS_MODE: {build / 'CMakeCache.txt'}")
     required(configured_symbols.group(1) == args.symbols_mode,
              f"package symbols mode {args.symbols_mode} differs from CMake mode {configured_symbols.group(1)}")
     generator = re.search(r"^CMAKE_GENERATOR:INTERNAL=(.+)$", cache, re.M)
@@ -276,20 +276,20 @@ def main() -> int:
     required(not rejected_skips,
              f"undocumented skipped tests: {[entry['test'] for entry in rejected_skips]}")
 
-    dll = build_artifact(build, "FreezeSentryF4.dll", args.config)
-    watch = build_artifact(build, "FreezeSentryF4Watch.exe", args.config)
+    dll = build_artifact(build, "FreezeLogger.dll", args.config)
+    watch = build_artifact(build, "FreezeLoggerWatch.exe", args.config)
     required(not stage.exists(), f"refusing to replace existing package stage: {stage}")
     required(stage.is_relative_to(ROOT / "build"), "package stage must stay under the repository build directory")
     generated_outputs = []
     try:
         subprocess.run(["cmake", "--install", str(build), "--prefix", str(stage), "--config", args.config], check=True)
         plugin_dir = stage / "F4SE/Plugins"
-        required((plugin_dir / "FreezeSentryF4.dll").read_bytes() == dll.read_bytes(), "installed DLL differs from build output")
-        required((plugin_dir / "FreezeSentryF4Watch.exe").read_bytes() == watch.read_bytes(), "installed watcher differs from build output")
-        required((plugin_dir / "FreezeSentryF4.ini").read_bytes() ==
-                 (ROOT / "dist/F4SE/Plugins/FreezeSentryF4.ini").read_bytes(), "installed INI differs from source INI")
+        required((plugin_dir / "FreezeLogger.dll").read_bytes() == dll.read_bytes(), "installed DLL differs from build output")
+        required((plugin_dir / "FreezeLoggerWatch.exe").read_bytes() == watch.read_bytes(), "installed watcher differs from build output")
+        required((plugin_dir / "FreezeLogger.ini").read_bytes() ==
+                 (ROOT / "dist/F4SE/Plugins/FreezeLogger.ini").read_bytes(), "installed INI differs from source INI")
         if args.symbols_mode == "required":
-            for name in ("FreezeSentryF4.pdb", "FreezeSentryF4Watch.pdb"):
+            for name in ("FreezeLogger.pdb", "FreezeLoggerWatch.pdb"):
                 staged_pdb = plugin_dir / name
                 built_pdb = build_artifact(build, name, args.config)
                 required(staged_pdb.read_bytes() == built_pdb.read_bytes(), f"installed PDB differs from build output: {name}")
@@ -297,15 +297,15 @@ def main() -> int:
             required(not any(path.is_file() and path.suffix.lower() == ".pdb" for path in stage.rglob("*")),
                      "symbols-free stage unexpectedly contains PDB files")
 
-        manifest = stage / "FreezeSentryF4/SHA256SUMS.txt"
+        manifest = stage / "FreezeLogger/SHA256SUMS.txt"
         payload = sorted(path for path in stage.rglob("*") if path.is_file() and path != manifest)
         manifest.write_text("".join(
             f"{sha256(path)}  {path.relative_to(stage).as_posix()}\n" for path in payload
         ), encoding="utf-8")
 
         artifacts.mkdir(parents=True, exist_ok=True)
-        binary = artifacts / f"FreezeSentryF4-{VERSION}-windows-x64.zip"
-        source = artifacts / f"FreezeSentryF4-{VERSION}-source.zip"
+        binary = artifacts / f"FreezeLogger-{VERSION}-windows-x64.zip"
+        source = artifacts / f"FreezeLogger-{VERSION}-source.zip"
         checksums = artifacts / f"SHA256SUMS-{VERSION}.txt"
         receipt_path = artifacts / f"validation-{VERSION}.json"
         for output in (binary, source, checksums, receipt_path):
@@ -343,7 +343,7 @@ def main() -> int:
                     required(archive.read(name) == (source_root / member).read_bytes(), f"archive content mismatch: {name}")
 
         with zipfile.ZipFile(binary) as archive:
-            for line in archive.read("FreezeSentryF4/SHA256SUMS.txt").decode("utf-8").splitlines():
+            for line in archive.read("FreezeLogger/SHA256SUMS.txt").decode("utf-8").splitlines():
                 expected, name = line.split("  ", 1)
                 required(hashlib.sha256(archive.read(name)).hexdigest() == expected, f"manifest mismatch: {name}")
 

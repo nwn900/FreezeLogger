@@ -53,7 +53,7 @@ void ticks(DWORD duration, bool normal = true, bool ui = true) {
 std::atomic<bool> spin = true;
 __declspec(noinline) void busyLoop() { while (spin.load(std::memory_order_relaxed)) {} }
 void deadlockFixture() {
-    auto prefix = L"Local\\FreezeSentryF4-test-" + std::to_wstring(GetCurrentProcessId());
+    auto prefix = L"Local\\FreezeLogger-test-" + std::to_wstring(GetCurrentProcessId());
     HANDLE a = CreateMutexW(nullptr, FALSE, (prefix + L"-A").c_str());
     HANDLE b = CreateMutexW(nullptr, FALSE, (prefix + L"-B").c_str());
     HANDLE readyA = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -93,18 +93,18 @@ int wmain(int argc, wchar_t** argv) {
     auto output = evidence / "reports";
     std::filesystem::create_directories(staging);
     std::filesystem::create_directories(output);
-    auto dll = staging / "FreezeSentryF4.dll";
+    auto dll = staging / "FreezeLogger.dll";
     std::filesystem::copy_file(argv[1], dll);
-    std::filesystem::copy_file(argv[2], staging / "FreezeSentryF4Watch.exe");
-    std::ofstream ini(staging / "FreezeSentryF4.ini");
-    ini << "[FreezeSentryF4]\nTimeoutSeconds=2\nLoadingTimeoutSeconds=5\nStartupTimeoutSeconds=5\n"
+    std::filesystem::copy_file(argv[2], staging / "FreezeLoggerWatch.exe");
+    std::ofstream ini(staging / "FreezeLogger.ini");
+    ini << "[FreezeLogger]\nTimeoutSeconds=2\nLoadingTimeoutSeconds=5\nStartupTimeoutSeconds=5\n"
            "EarlyWarningSeconds=1\nProfileMilliseconds=500\nFrameMonitoring=0\n"
            "WriteMinidump=1\nFullMemoryDump=1\nMaxReports=10\nReportDirectory=" << output.string() << '\n';
     ini.close();
     // The watcher reads an optional layout override file from its own folder.
     // This row targets a runtime the fixture never reports, so it exercises the
     // read path without changing which layout the adapter resolves.
-    { std::ofstream layout(staging / "FreezeSentryF4.layout.ini");
+    { std::ofstream layout(staging / "FreezeLogger.layout.ini");
       layout << "[Layout.010C0000]\nPlayerRva=0x1111\nUiRva=0x2222\n"
                 "PlayerCellOffset=0xB8\nCellFormIdOffset=0x14\nCellTypeOffset=0x1A\n"
                 "UiStackOffset=0x190\nUiTableOffset=0x1B0\nUiTableEntriesOffset=0x20\n"
@@ -136,8 +136,8 @@ int wmain(int argc, wchar_t** argv) {
     check(!load(&host), "duplicate DLL initialization rejected without second helper");
     check(listener != nullptr, "messaging callback registered");
     check(movieCallback && movieCallback(reinterpret_cast<void*>(0x1234), nullptr), "Scaleform movie creation observed without game layouts");
-    auto recordEvent = reinterpret_cast<fs::RecordEvent>(GetProcAddress(plugin, "FreezeSentryF4_RecordEvent"));
-    auto framePulse = reinterpret_cast<fs::FramePulse>(GetProcAddress(plugin, "FreezeSentryF4_FramePulse"));
+    auto recordEvent = reinterpret_cast<fs::RecordEvent>(GetProcAddress(plugin, "FreezeLogger_RecordEvent"));
+    auto framePulse = reinterpret_cast<fs::FramePulse>(GetProcAddress(plugin, "FreezeLogger_FramePulse"));
     check(recordEvent && framePulse, "native telemetry exports");
     SetLastError(0x123456);
     check(framePulse(), "native frame provider publishes progress without game offsets");
@@ -209,7 +209,7 @@ int wmain(int argc, wchar_t** argv) {
     check(text.find("disk_sha256=") != std::string::npos && text.find("instruction_bytes_at_RIP=") != std::string::npos &&
           text.find("WAIT_CHAINS") != std::string::npos && text.find("R15=0x") != std::string::npos,
           "repair-oriented module identity, instruction bytes, wait chain and register evidence");
-    check(text.find("deadlock_cycle=1") != std::string::npos && text.find("FreezeSentryF4-test-") != std::string::npos,
+    check(text.find("deadlock_cycle=1") != std::string::npos && text.find("FreezeLogger-test-") != std::string::npos,
           "WCT identifies the known real mutex deadlock and its object names");
     check(text.find("busyLoop") != std::string::npos, "local symbols identify known busy loop");
     check(text.find("test.cpp:") != std::string::npos, "local PDB provides source file and line for repair");
@@ -223,7 +223,7 @@ int wmain(int argc, wchar_t** argv) {
           "native fault breadcrumbs preserve the wrapped chronological range without suppressing handled exceptions");
     check(text.find("NORMAL_TASK_CALLBACK") != std::string::npos && text.find("THREADS") != std::string::npos,
           "actual target thread contexts and attribution");
-    check(text.find("FreezeSentryF4Tests.exe+") != std::string::npos, "module-relative stack data");
+    check(text.find("FreezeLoggerTests.exe+") != std::string::npos, "module-relative stack data");
     auto dump = incident.front(); dump.replace_extension(".dmp");
     check(std::filesystem::exists(dump) && std::filesystem::file_size(dump) > 4096, "minidump written externally");
     std::string validation;

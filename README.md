@@ -1,4 +1,4 @@
-# FreezeSentryF4
+# Freeze Logger
 
 Original Fallout 4 F4SE freeze logger: a small DLL plus a separate Windows
 collector. The DLL uses public F4SE interfaces; no Address Library, CommonLib
@@ -15,6 +15,17 @@ matching exception and loaded-module evidence only corroborate a log and do not
 prove which overlapping same-version process wrote it. See
 [validation](docs/VALIDATION.md) for evidence and limits.
 
+## Renamed from FreezeSentryF4
+
+The mod is now **Freeze Logger**: `FreezeLogger.dll`, `FreezeLoggerWatch.exe`,
+`FreezeLogger.ini`, and the `FreezeLogger` report folder. Existing installs
+keep working: the plugin still reads a legacy `FreezeSentryF4.ini` and
+`[FreezeSentryF4]` section when the new names are absent, keeps using an
+existing `.../F4SE/FreezeSentryF4` report folder, and the old
+`FreezeSentryF4_RecordEvent` / `FreezeSentryF4_FramePulse` exports remain as
+aliases. Remove the old DLL, EXE and INI when upgrading so F4SE does not load
+both plugins.
+
 ## Install
 
 Install the package through Vortex/MO2, or copy its `F4SE/Plugins` folder into
@@ -24,7 +35,7 @@ x64 Redistributable are required. Keep the supplied PDBs beside the binaries.
 No ESP or save changes are needed. Disable/remove the mod while the game is
 closed to uninstall it.
 
-Reports: `Documents/My Games/Fallout4/F4SE/FreezeSentryF4` (or `Fallout4VR`).
+Reports: `Documents/My Games/Fallout4/F4SE/FreezeLogger` (or `Fallout4VR`).
 The optional absolute `ReportDirectory` in the INI supports custom save/profile
 locations. A startup/error log is also written beside the DLL. The collector
 has no visible window and exits when the game exits.
@@ -114,9 +125,9 @@ it must survive these limits.
 
 ## Optional native context providers
 
-The DLL exports `FreezeSentryF4_RecordEvent(const fs::EventData*)` and
-`FreezeSentryF4_FramePulse()`. The standalone header is `src/telemetry.hpp` (also
-packaged under `FreezeSentryF4/include`). Resolve the exports from the loaded
+The DLL exports `FreezeLogger_RecordEvent(const fs::EventData*)` and
+`FreezeLogger_FramePulse()`. The standalone header is `src/telemetry.hpp` (also
+packaged under `FreezeLogger/include`). Resolve the exports from the loaded
 logger DLL; a false return means unsupported/malformed input or concurrent-event
 drop. Events are copied immediately into the shared ring; callbacks do no disk
 I/O. Inline UTF-8 fields must be terminated, with version=1 and size=384.
@@ -136,7 +147,7 @@ and the active menu stack about every 500 ms. A built-in row is enabled only
 when the on-disk executable hash matches the row's fingerprint and the derived
 globals land in readable, non-executable image data; a hash mismatch is
 **unqualified** and disables the adapter instead of enabling it with a warning.
-Rows supplied through `FreezeSentryF4.layout.ini` are opt-in and structural-only
+Rows supplied through `FreezeLogger.layout.ini` are opt-in and structural-only
 (no fingerprint), and every row is validated before it can replace a built-in.
 Unknown versions/images are skipped. Two equal reads, bounded arrays/strings,
 vtable/type checks and ReadProcessMemory failures discard unreadable samples.
@@ -216,7 +227,7 @@ From an x64 MSVC developer shell with CMake/Ninja:
 
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo `
-  -DFSF4_SYMBOLS_MODE=required
+  -DFREELOGGER_SYMBOLS_MODE=required
 cmake --build build
 ctest --test-dir build --output-on-failure `
   --output-junit "$((Get-Location).Path)\build\validation-0.3.6.xml"
@@ -229,7 +240,7 @@ python scripts/verify_release.py --build build --config RelWithDebInfo --symbols
 
 The default diagnostic package requires both compiler PDBs and checks their
 GUID/age against the packaged DLL and watcher. A deliberate symbols-free package
-must configure CMake with `-DFSF4_SYMBOLS_MODE=none` and pass
+must configure CMake with `-DFREELOGGER_SYMBOLS_MODE=none` and pass
 `--symbols-mode none` to the packager and verifier; that mode rejects any PDB in
 the package.
 

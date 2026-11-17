@@ -16,7 +16,7 @@ int wmain(int argc, wchar_t** argv) {
     check(argc == 3, "DLL/helper arguments");
     auto directory = std::filesystem::path(argv[1]).parent_path() / ("init-evidence-" + std::to_string(GetCurrentProcessId()));
     std::filesystem::create_directories(directory);
-    auto dll = directory / "FreezeSentryF4.dll"; std::filesystem::copy_file(argv[1], dll);
+    auto dll = directory / "FreezeLogger.dll"; std::filesystem::copy_file(argv[1], dll);
     HMODULE module = LoadLibraryW(dll.c_str()); check(module != nullptr, "load init fixture DLL");
     auto load = reinterpret_cast<bool(*)(const fs::Host*)>(GetProcAddress(module, "F4SEPlugin_Load"));
     check(load != nullptr, "initialization entry point");
@@ -30,11 +30,11 @@ int wmain(int argc, wchar_t** argv) {
     GetProcessHandleCount(GetCurrentProcess(), &after);
     std::cout << "failure_retry_handles before=" << before << " after=" << after << '\n';
     check(after == before, "missing-helper retries release mapping handles");
-    std::filesystem::copy_file(argv[2], directory / "FreezeSentryF4Watch.exe");
+    std::filesystem::copy_file(argv[2], directory / "FreezeLoggerWatch.exe");
     auto blocked = directory / "not-a-directory"; { std::ofstream file(blocked); file << "fixture"; }
     auto writeIni = [&](const std::filesystem::path& output) {
-        std::ofstream ini(directory / "FreezeSentryF4.ini");
-        ini << "[FreezeSentryF4]\nFrameMonitoring=0\nContextMonitoring=0\nMaxReports=1\nReportDirectory=" << output.string() << '\n';
+        std::ofstream ini(directory / "FreezeLogger.ini");
+        ini << "[FreezeLogger]\nFrameMonitoring=0\nContextMonitoring=0\nMaxReports=1\nReportDirectory=" << output.string() << '\n';
     };
     writeIni(blocked);
     check(!load(&host), "unwritable report directory fails before readiness handshake");

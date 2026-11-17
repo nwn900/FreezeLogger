@@ -1,4 +1,4 @@
-# FreezeSentryF4
+# Freeze Logger
 
 Build an original Windows x64 F4SE freeze logger. Scope includes every Fallout 4
 runtime for which a matching F4SE provides Messaging v1, including VR,

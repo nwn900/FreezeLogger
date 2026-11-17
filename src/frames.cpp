@@ -78,7 +78,7 @@ ULONG FrameObserver::start() {
     InterlockedExchange(&state->frameStatus, ERROR_IO_PENDING);
     if (!state->frameMonitoring) return ERROR_NOT_SUPPORTED;
     if (!QueryPerformanceFrequency(&qpcFrequency) || qpcFrequency.QuadPart <= 0) return ERROR_NOT_SUPPORTED;
-    name = L"FreezeSentryF4-" + std::to_wstring(state->pid) + L"-" + std::to_wstring(read(state->processCreated));
+    name = L"FreezeLogger-" + std::to_wstring(state->pid) + L"-" + std::to_wstring(read(state->processCreated));
     auto* properties = reinterpret_cast<EVENT_TRACE_PROPERTIES*>(buffer.data());
     properties->Wnode.BufferSize = static_cast<ULONG>(buffer.size());
     properties->Wnode.Flags = WNODE_FLAG_TRACED_GUID; properties->Wnode.ClientContext = 1;
