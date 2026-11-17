@@ -215,10 +215,15 @@ std::filesystem::path reportRoot(bool vr);
 // Test-only injection points for the capture availability checks.
 void setCommitProbeForTest(bool (*probe)());
 void setPssProbeForTest(bool (*probe)());
-// What a capture actually produced. A text-only report is not a dump.
+void setCaptureLogFailureForTest(int (*probe)());
+// What a capture actually produced. Capabilities are independent: a Toolhelp
+// thread inventory is not a PSS snapshot, and a text report is not a dump.
 struct CaptureResult {
     bool textComplete = false;
-    bool snapshotCaptured = false;
+    bool anyThreadEvidence = false;
+    bool pssSnapshotCaptured = false;
+    bool threadContextsAvailable = false;
+    bool vaCloneCaptured = false;
     bool dumpRequested = false;
     bool dumpValidated = false;
 };

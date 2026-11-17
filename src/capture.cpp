@@ -23,9 +23,10 @@
 #include <mutex>
 
 namespace fs {
-namespace { bool (*commitProbe)() = nullptr; bool (*pssProbe)() = nullptr; }
+namespace { bool (*commitProbe)() = nullptr; bool (*pssProbe)() = nullptr; int (*logFailureProbe)() = nullptr; }
 void setCommitProbeForTest(bool (*probe)()) { commitProbe = probe; }
 void setPssProbeForTest(bool (*probe)()) { pssProbe = probe; }
+void setCaptureLogFailureForTest(int (*probe)()) { logFailureProbe = probe; }
 std::filesystem::path reportRoot(bool vr) {
     PWSTR documents = nullptr;
     auto result = SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &documents);
@@ -536,6 +537,7 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     auto logPath = folder / (stem.str() + ".log");
     std::ofstream log(logPath, std::ios::out | std::ios::trunc);
     if (!log) return false;
+    if (logFailureProbe && logFailureProbe() == 1) return false;
     log << "FreezeSentryF4 " << toolVersion << "\nUTC=" << utc.wYear << '-' << utc.wMonth << '-' << utc.wDay << ' '
         << utc.wHour << ':' << utc.wMinute << ':' << utc.wSecond << "\nPID=" << pid
         << " reason=" << reason << " tick=" << now() << '\n';
@@ -631,6 +633,11 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     }
     log << "snapshot_capture_ms=" << now() - captureBegan << " dump_transport="
         << (cloneMode ? "pss-snapshot" : "pss-thread-only") << '\n';
+    if (result) {
+        result->pssSnapshotCaptured = true;
+        result->threadContextsAvailable = true;
+        result->vaCloneCaptured = cloneMode;
+    }
     PSS_VA_CLONE_INFORMATION clone{};
     if (cloneMode) {
         if (!snapshot.trackClone()) {
@@ -924,12 +931,32 @@ bool capture(HANDLE target, DWORD pid, const std::filesystem::path& folder,
     log << "\nMODULE_FILE_IDENTITIES (on-disk files; compare to loaded PE/PDB identity above)\n";
     for (const auto& [path, m] : identities)
         log << diagnosticPath(m.path) << " version=" << version(m.path) << " disk_sha256=" << sha256(m.path) << '\n';
+    if (logFailureProbe && logFailureProbe() == 2) log.setstate(std::ios::badbit);
     log << "\ncollection complete\n";
-    if (result) {
-        result->snapshotCaptured = sampled;
-        result->dumpRequested = dump;
-        result->textComplete = sampled && log.good();
+    // Persist before claiming completion: buffered writes and close can fail
+    // after the last logical line was written.
+    log.flush();
+    bool flushed = log.good();
+    log.close();
+    bool closed = !log.fail();
+    bool persisted = flushed && closed;
+    if (persisted) {
+        std::ifstream verify(logPath, std::ios::binary);
+        if (verify) {
+            verify.seekg(0, std::ios::end);
+            const std::streamoff end = static_cast<std::streamoff>(verify.tellg());
+            const std::streamoff start = end > 64 ? end - 64 : 0;
+            verify.seekg(start);
+            std::string tail(static_cast<std::size_t>(end - start), '\0');
+            verify.read(tail.data(), static_cast<std::streamsize>(tail.size()));
+            persisted = tail.find("collection complete") != std::string::npos;
+        } else persisted = false;
     }
-    return sampled && log.good();
+    if (result) {
+        result->anyThreadEvidence = sampled;
+        result->dumpRequested = dump;
+        result->textComplete = sampled && persisted;
+    }
+    return sampled && persisted;
 }
 }

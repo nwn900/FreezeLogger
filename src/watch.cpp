@@ -207,7 +207,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
                 bool complete = fs::capture(target, state->pid, folder, reason, state, state->writeDump != 0,
                     contextEvidence() + history.text(), reason == "fatal-exception", &result);
                 session << "tick=" << fs::now() << " incident=" << reason << " collection_complete=" << complete
-                        << " text_complete=" << result.textComplete << " snapshot_captured=" << result.snapshotCaptured
+                        << " text_complete=" << result.textComplete << " any_thread_evidence=" << result.anyThreadEvidence
+                        << " pss_snapshot=" << result.pssSnapshotCaptured << " thread_contexts=" << result.threadContextsAvailable
+                        << " va_clone=" << result.vaCloneCaptured
                         << " dump_requested=" << result.dumpRequested << " dump_validated=" << result.dumpValidated << '\n';
                 fs::retain(folder, state->maxFreezeReports, state->maxManualReports, state->storageMB, sessionPath);
             } catch (const std::exception& error) {
