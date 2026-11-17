@@ -83,12 +83,25 @@ PACKAGED_DIRECTORIES = ("src", "tests", "docs", "dist", "scripts", "fuzz", "tool
 PACKAGED_ROOT_FILES = (".gitignore", "CMakeLists.txt", "README.md", "LICENSE")
 
 
+def packaged_path(path: str) -> bool:
+    """Whether a path enters the source archive (mirrors its rglob policy)."""
+    if path in PACKAGED_ROOT_FILES:
+        return True
+    parts = path.split("/")
+    if parts[0] not in PACKAGED_DIRECTORIES:
+        return False
+    if parts[0] == "docs" and len(parts) > 1 and parts[1] == "agent-work":
+        return False
+    return True
+
+
 def packaged_status_lines(status: str) -> list[str]:
     """Porcelain -z entries for files that would enter the source archive.
 
     The -z format is NUL-delimited and never quotes paths, so spaces, quotes and
     non-ASCII names are parsed exactly. Rename/copy entries carry the original
-    path as the next NUL-delimited field.
+    path as the next NUL-delimited field; both sides count because a file
+    leaving a packaged subtree disappears from the archive.
     """
     entries = status.split("\0")
     lines = []
@@ -102,11 +115,14 @@ def packaged_status_lines(status: str) -> list[str]:
             raise ValueError(f"unparseable git status entry: {entry!r}")
         code = entry[:2]
         path = entry[3:]
+        old_path = None
         if code[0] in "RC" or code[1] in "RC":
-            if index < len(entries):
-                index += 1  # original path of the rename/copy
-        if path in PACKAGED_ROOT_FILES or path.split("/", 1)[0] in PACKAGED_DIRECTORIES:
-            lines.append(f"{code} {path}")
+            if index >= len(entries):
+                raise ValueError(f"rename/copy entry without its original path: {entry!r}")
+            old_path = entries[index]
+            index += 1
+        if packaged_path(path) or (old_path is not None and packaged_path(old_path)):
+            lines.append(f"{code} {path}" + (f" <- {old_path}" if old_path else ""))
     return lines
 
 

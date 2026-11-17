@@ -294,6 +294,47 @@ class PackageProvenanceTests(unittest.TestCase):
             joined = "\n".join(package.packaged_status_lines(status))
             self.assertIn("renamed source.cpp", joined)
 
+    def git_status_lines(self, repo):
+        status = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                                cwd=repo, capture_output=True, text=True, check=True).stdout
+        return package.packaged_status_lines(status)
+
+    def test_cross_boundary_rename_marks_dirty(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            (repo / "src").mkdir()
+            (repo / "src" / "a.cpp").write_text("a", encoding="utf-8")
+            (repo / "src" / "c.cpp").write_text("c", encoding="utf-8")
+            (repo / "scratch").mkdir()
+            (repo / "scratch" / "b.cpp").write_text("b", encoding="utf-8")
+            (repo / "docs" / "agent-work").mkdir(parents=True)
+            (repo / "docs" / "agent-work" / "x.md").write_text("x", encoding="utf-8")
+            (repo / "docs" / "guide.md").write_text("g", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+            subprocess.run(["git", "mv", "src/a.cpp", "scratch/a.cpp"], cwd=repo, check=True)
+            lines = self.git_status_lines(repo)
+            self.assertTrue(any("scratch/a.cpp" in line and "src/a.cpp" in line for line in lines),
+                            "a file leaving a packaged subtree must mark the source dirty")
+            subprocess.run(["git", "mv", "scratch/b.cpp", "src/b.cpp"], cwd=repo, check=True)
+            lines = self.git_status_lines(repo)
+            self.assertTrue(any("src/b.cpp" in line for line in lines),
+                            "a file entering a packaged subtree must mark the source dirty")
+            subprocess.run(["git", "mv", "src/c.cpp", "src/d.cpp"], cwd=repo, check=True)
+            lines = self.git_status_lines(repo)
+            self.assertTrue(any("src/d.cpp" in line for line in lines), "an in-tree rename is dirty")
+            subprocess.run(["git", "mv", "docs/agent-work/x.md", "docs/agent-work/y.md"], cwd=repo, check=True)
+            lines = self.git_status_lines(repo)
+            self.assertFalse(any("agent-work" in line for line in lines),
+                             "a rename inside the excluded directory is not packaged provenance")
+            subprocess.run(["git", "mv", "docs/guide.md", "docs/agent-work/guide.md"], cwd=repo, check=True)
+            lines = self.git_status_lines(repo)
+            self.assertTrue(any("agent-work/guide.md" in line for line in lines),
+                            "a file leaving the packaged docs tree is dirty")
+
     def test_archive_manifest_digest_is_stable(self):
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "source.zip"
