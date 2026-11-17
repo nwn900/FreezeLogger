@@ -2,6 +2,7 @@ import contextlib
 import io
 import os
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -259,12 +260,39 @@ class PackageProvenanceTests(unittest.TestCase):
         self.assertIn("frames.hpp", names)
 
     def test_untracked_packaged_file_marks_dirty(self):
-        status = "?? src/new.cpp\n?? .cursor/state.json\n M tests/test.cpp\n?? docs/notes.md\n"
+        status = "?? src/new.cpp\0?? .cursor/state.json\0 M tests/test.cpp\0?? docs/notes.md\0"
         lines = package.packaged_status_lines(status)
         self.assertIn("?? src/new.cpp", lines)
         self.assertIn(" M tests/test.cpp", lines)
         self.assertIn("?? docs/notes.md", lines)
         self.assertNotIn("?? .cursor/state.json", lines)
+
+    def test_quoted_git_paths_are_detected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            (repo / "src").mkdir()
+            (repo / "src" / "my source.cpp").write_text("a", encoding="utf-8")
+            (repo / "src" / "zażółć.cpp").write_text("a", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+            (repo / "src" / "my source.cpp").write_text("b", encoding="utf-8")
+            (repo / "src" / "zażółć.cpp").write_text("b", encoding="utf-8")
+            (repo / "tests").mkdir()
+            (repo / "tests" / "new feature.cpp").write_text("c", encoding="utf-8")
+            status = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                                    cwd=repo, capture_output=True, text=True, check=True).stdout
+            joined = "\n".join(package.packaged_status_lines(status))
+            self.assertIn("my source.cpp", joined)
+            self.assertIn("zażółć.cpp", joined)
+            self.assertIn("new feature.cpp", joined)
+            subprocess.run(["git", "mv", "src/my source.cpp", "src/renamed source.cpp"], cwd=repo, check=True)
+            status = subprocess.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                                    cwd=repo, capture_output=True, text=True, check=True).stdout
+            joined = "\n".join(package.packaged_status_lines(status))
+            self.assertIn("renamed source.cpp", joined)
 
     def test_archive_manifest_digest_is_stable(self):
         with tempfile.TemporaryDirectory() as temporary:

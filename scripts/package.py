@@ -84,16 +84,29 @@ PACKAGED_ROOT_FILES = (".gitignore", "CMakeLists.txt", "README.md", "LICENSE")
 
 
 def packaged_status_lines(status: str) -> list[str]:
-    """Porcelain lines for files that would enter the source archive."""
+    """Porcelain -z entries for files that would enter the source archive.
+
+    The -z format is NUL-delimited and never quotes paths, so spaces, quotes and
+    non-ASCII names are parsed exactly. Rename/copy entries carry the original
+    path as the next NUL-delimited field.
+    """
+    entries = status.split("\0")
     lines = []
-    for line in status.splitlines():
-        if len(line) < 4:
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if not entry:
             continue
-        path = line[3:].strip()
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1]
+        if len(entry) < 4:
+            raise ValueError(f"unparseable git status entry: {entry!r}")
+        code = entry[:2]
+        path = entry[3:]
+        if code[0] in "RC" or code[1] in "RC":
+            if index < len(entries):
+                index += 1  # original path of the rename/copy
         if path in PACKAGED_ROOT_FILES or path.split("/", 1)[0] in PACKAGED_DIRECTORIES:
-            lines.append(line)
+            lines.append(f"{code} {path}")
     return lines
 
 
@@ -108,9 +121,13 @@ def source_manifest() -> dict:
                               check=True).stdout
     try:
         commit = git("rev-parse", "HEAD").strip()
-        packaged = packaged_status_lines(git("status", "--porcelain"))
     except (subprocess.CalledProcessError, FileNotFoundError):
         return {"commit": "unavailable", "dirty": None, "dirty_paths": []}
+    try:
+        packaged = packaged_status_lines(git("status", "--porcelain=v1", "-z", "--untracked-files=all"))
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as error:
+        # Fail closed: unknown provenance is not a clean tree.
+        return {"commit": commit, "dirty": None, "dirty_paths": [], "error": str(error)}
     return {"commit": commit, "dirty": bool(packaged), "dirty_paths": packaged[:20]}
 
 
